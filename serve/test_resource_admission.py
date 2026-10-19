@@ -154,3 +154,50 @@ def test_cross_worker_budget_race_has_one_winner():
     assert sum(lease is not None for lease in leases) == 1
     assert ledger.snapshot()["host_bytes"] == 10
     assert sum(ledger.snapshot()["gpu_bytes"].values()) == 10
+
+
+def test_reopen_requires_same_registered_draining_quiescent_worker():
+    ledger = ResourceLedger(30, {"0": 30})
+    handle = ledger.register_worker("a", "0", 1, 5, 7)
+    with pytest.raises(AdmissionRejected, match="draining and quiescent"):
+        ledger.reopen_worker(handle)
+    lease = ledger.acquire(handle, 10, 10)
+    ledger.begin_drain(handle)
+    with pytest.raises(AdmissionRejected, match="draining and quiescent"):
+        ledger.reopen_worker(handle)
+    assert ledger.snapshot()["host_bytes"] == 15
+    done(ledger, lease)
+    ledger.reopen_worker(handle)
+    snap = ledger.snapshot()
+    assert snap["workers"]["a"]["generation"] == handle.generation
+    assert not snap["workers"]["a"]["draining"]
+    assert snap["host_bytes"] == 5
+    assert snap["gpu_bytes"] == {"0": 7}
+    next_lease = ledger.acquire(handle, 10, 10)
+    assert not done(ledger, lease)
+    assert ledger.snapshot()["active_reservations"] == 1
+    done(ledger, next_lease)
+    ledger.begin_drain(handle)
+    ledger.unregister_worker(handle)
+    replacement = ledger.register_worker("a", "0", 1, 5, 7)
+    ledger.begin_drain(replacement)
+    with pytest.raises(AdmissionRejected, match="generation"):
+        ledger.reopen_worker(handle)
+    assert ledger.snapshot()["workers"]["a"]["draining"]
+
+
+def test_reopen_race_allows_only_one_explicit_resume():
+    ledger = ResourceLedger(10, {"0": 10})
+    handle = ledger.register_worker("a", "0", 1)
+    ledger.begin_drain(handle)
+    barrier = threading.Barrier(8)
+    def attempt(_):
+        barrier.wait()
+        try:
+            ledger.reopen_worker(handle)
+            return True
+        except AdmissionRejected:
+            return False
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        assert sum(pool.map(attempt, range(8))) == 1
+    assert not ledger.snapshot()["workers"]["a"]["draining"]

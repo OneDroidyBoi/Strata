@@ -2,6 +2,7 @@
 #pragma once
 #include "strata/core/conversation_cache.hpp"
 #include <limits>
+#include <charconv>
 #include <string>
 #include <vector>
 namespace strata::core {
@@ -24,6 +25,37 @@ inline bool session_inventory_append_slots(const std::vector<SessionInventorySlo
     }
     for (const auto& slot : slots)
         if (slot.tokens) entries.push_back({"slot-" + std::to_string(slot.index), "slot", slot.tokens});
+    return true;
+}
+// Parse the whole slot selector, never an atoi prefix; keep spaces in the filesystem path.
+inline bool session_slot_restore_parse(const std::string& command, size_t count, size_t& slot,
+                                       std::string& path, std::string& error) {
+    constexpr size_t prefix = 13; // "RESTORE_SLOT "
+    const size_t end = command.find(' ', prefix);
+    if (command.rfind("RESTORE_SLOT ", 0) != 0 || end == std::string::npos || end + 1 == command.size()) {
+        error = "expected RESTORE_SLOT <slot> <path>"; return false;
+    }
+    size_t parsed = 0;
+    const auto result = std::from_chars(command.data() + prefix, command.data() + end, parsed);
+    if (result.ec != std::errc() || result.ptr != command.data() + end || parsed >= count ||
+        command.substr(prefix, end - prefix) != std::to_string(parsed)) {
+        error = "invalid restore slot"; return false;
+    }
+    const std::string candidate = command.substr(end + 1);
+    if (candidate.find('\0') != std::string::npos || candidate.find_first_of("\r\n") != std::string::npos) {
+        error = "restore path contains a protocol control character"; return false;
+    }
+    slot = parsed; path = candidate; return true;
+}
+inline bool session_slot_restore_ready(const std::vector<SessionInventorySlot>& slots, size_t target,
+                                       bool supported, bool runtime_empty, std::string& error) {
+    if (!supported || target >= slots.size()) { error = "batch slot restore is not supported"; return false; }
+    for (const auto& slot : slots)
+        if (slot.active || slot.partial) { error = "batch must be fully quiescent before slot restore"; return false; }
+    const auto& slot = slots[target];
+    if (!runtime_empty || !slot.layout_valid || slot.tokens || slot.checkpoints || slot.cached || slot.tainted || slot.images) {
+        error = "restore target must be an empty, untainted slot"; return false;
+    }
     return true;
 }
 class SessionInventory {

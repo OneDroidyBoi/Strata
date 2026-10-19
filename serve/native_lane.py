@@ -2,7 +2,8 @@
 
 Only audited Flash-Next lanes with advertised native export support are admitted.
 The public operations hold FIFO and, for batching, the engine control lock from
-completed request drain through export/stop. Restore destinations remain unbatched.
+completed request drain through export/stop. Batch restore additionally requires
+its own advertised capability; ordinary RESTORE remains unbatched.
 Engine inventory/export methods are protocol parsers; they must not acquire the
 service FIFO themselves. ModelIdentity remains an owner-supplied identity binding.
 
@@ -24,7 +25,7 @@ import threading
 import time
 
 from serve.backends import ModelIdentity, SessionMetadata
-from serve.lane_lifecycle import LaneLifecycle
+from serve.lane_lifecycle import LaneLifecycle, LifecycleResult
 from serve.request_admission import RequestAdmission
 
 
@@ -48,6 +49,10 @@ class NativeLaneWorker:
         self._inventory_detail = None
         self._lifecycle = None
         self._store = None
+        self._gated_process = None
+        self._restore_failed = False
+        self._resume_inventory = None
+        self._resume_held = {}
         self._validate_engine()
 
     def _validate_engine(self):
@@ -173,7 +178,10 @@ class NativeLaneWorker:
 
     def persist_and_stop(self, store, timeout_s=30.0):
         with self._transaction():
-            return self._controller(store).persist_and_stop(timeout_s)
+            result = self._controller(store).persist_and_stop(timeout_s)
+            if result.state == 'blocked':
+                self._restore_failed = True
+            return result
 
     def lazy_restore(self, store, checkpoint_id, session_id, timeout_s=30.0):
         if getattr(self.engine, 'batch', 0):
@@ -181,8 +189,121 @@ class NativeLaneWorker:
         with self._transaction():
             return self._controller(store).lazy_restore(checkpoint_id, session_id, timeout_s)
 
+    def restore_slot(self, store, checkpoint_id, session_id, slot, timeout_s=30.0):
+        """Restore one verified bundle entry into an EMPTY native batch slot.
+
+        Both native inventory and Python routing state must show an empty target.
+        Other slots remain untouched. Multiple distinct slots can be restored
+        under the sticky gate; any failed attempt requires owner recovery before
+        resume. Fixed host residency estimates must cover retained slot cache storage
+        AND the full checkpoint read-image scratch peak during each restore.
+        """
+        with self._transaction():
+            try:
+                if self._restore_failed:
+                    raise RuntimeError('a prior lane operation failed; owner recovery is required')
+                self._controller(store)
+                if (not getattr(self.engine, 'batch', 0)
+                        or getattr(self.engine, 'session_batch_restore', False) is not True
+                        or not callable(getattr(self.engine, 'session_restore_slot', None))):
+                    raise ValueError('native batch slot restore is not advertised')
+                if type(slot) is not int or not 0 <= slot < self.engine.batch:
+                    raise ValueError('restore target slot is outside this lane')
+                self.gate_admission()
+                if not self.wait_drained(timeout_s):
+                    raise RuntimeError('restore lane did not drain')
+                before = self._snapshot()[2]
+                if self._resume_inventory is not None and before != self._resume_inventory:
+                    raise RuntimeError('native inventory changed between slot restores')
+                target = f'slot-{slot}'
+                if any(row[0] == target for row in before[1]):
+                    raise ValueError('restore target slot is already cached')
+                with self.engine.slot_cv:
+                    held = getattr(self.engine, 'slot_held', None)
+                    if not isinstance(held, list) or len(held) != self.engine.batch or held[slot]:
+                        raise ValueError('restore target has cached or invalid Python routing state')
+
+                def restore(session, path):
+                    if session.model != self.model:
+                        raise ValueError('checkpoint session model identity mismatch')
+                    reply = self.engine.session_restore_slot(slot, str(path))
+                    self._owned(drained=True)
+                    if not isinstance(reply, dict):
+                        raise ValueError('invalid native slot restore acknowledgement')
+                    count, ids = reply.get('tokens'), reply.get('ids')
+                    if (type(count) is not int or count <= 0 or not isinstance(ids, list)
+                            or len(ids) != count or any(type(i) is not int or not 0 <= i <= 0x7fffffff for i in ids)):
+                        raise ValueError('restored slot token IDs/count are invalid')
+                    after = self._snapshot()[2]
+                    other = tuple(row for row in after[1] if row[0] != target)
+                    new = [row for row in after[1] if row[0] == target]
+                    if (after[0] == before[0] or other != before[1]
+                            or new != [(target, 'slot', count)]):
+                        raise RuntimeError('slot restore changed other state or failed to publish the target')
+                    with self.engine.slot_cv:
+                        self.engine.slot_held[slot] = list(ids)
+                        used = getattr(self.engine, 'slot_used', None)
+                        if isinstance(used, list) and len(used) == self.engine.batch:
+                            used[slot] = time.time()
+                    self._resume_held[slot] = tuple(ids)
+                    self._resume_inventory = after
+
+                store.restore(checkpoint_id, session_id, self.model, restore)
+                return LifecycleResult('restored', checkpoint_id)
+            except Exception as exc:
+                self._restore_failed = True
+                self.service.native_lane_gated = True
+                try:
+                    self.admission.gate_admission()
+                except Exception:
+                    pass
+                return LifecycleResult('blocked', checkpoint_id, f'{type(exc).__name__}: {exc}')
+
+    def resume(self, timeout_s=30.0):
+        """Explicitly reopen only a verified, unchanged batch-restore transaction.
+
+        No restore, any failed operation, process replacement, unresolved native
+        ownership or changed routing/inventory leaves admission gated. Reopening
+        uses the same registered ledger worker, retaining its fixed residency.
+        """
+        with self._transaction():
+            try:
+                if self._restore_failed or self._resume_inventory is None or not self._resume_held:
+                    raise RuntimeError('resume requires successful restores and no failed lane operation')
+                if getattr(self.service, 'native_lane_gated', False) is not True:
+                    raise RuntimeError('native lane is not gated')
+                self.gate_admission()
+                if not self.wait_drained(timeout_s):
+                    raise RuntimeError('resume lane did not drain')
+                if self._snapshot()[2] != self._resume_inventory:
+                    raise RuntimeError('native inventory changed before resume')
+                with self.engine.slot_cv:
+                    for slot, ids in self._resume_held.items():
+                        if tuple(self.engine.slot_held[slot]) != ids:
+                            raise RuntimeError('restored slot routing state changed before resume')
+                self._owned(drained=True)
+                self.admission.resume_admission()
+                self.service.native_lane_gated = False
+                self._gated_process = None
+                self._resume_inventory = None
+                self._resume_held = {}
+                return LifecycleResult('resumed')
+            except Exception as exc:
+                self._restore_failed = True
+                # A rejected resume never creates an ungated escape route.
+                self.service.native_lane_gated = True
+                try:
+                    self.admission.gate_admission()
+                except Exception:
+                    pass
+                return LifecycleResult('blocked', error=f'{type(exc).__name__}: {exc}')
+
     def gate_admission(self):
         self._owned()
+        current = (self.engine.proc, getattr(self.engine, 'gen', None))
+        if self._gated_process is not None and self._gated_process != current:
+            raise RuntimeError('native process changed between gated lane operations')
+        self._gated_process = current
         self.admission.gate_admission()
         self.service.native_lane_gated = True
 
@@ -213,7 +334,7 @@ class NativeLaneWorker:
         # Admission stays gated. All ordinary state/control changes must use FIFO.
         return True
 
-    def list_sessions(self):
+    def _snapshot(self):
         self._owned(drained=True)
         inventory = self.engine.session_inventory()
         self._owned(drained=True)
@@ -233,6 +354,10 @@ class NativeLaneWorker:
             if not known <= slot_ids:
                 raise ValueError('native inventory omitted a known cached slot')
         detail = (generation, tuple((e['id'], e['kind'], e['tokens']) for e in inventory['sessions']))
+        return generation, ids, detail
+
+    def list_sessions(self):
+        generation, ids, detail = self._snapshot()
         if self._inventory_detail is not None and self._inventory_detail != detail:
             raise RuntimeError('native inventory changed during checkpoint transaction')
         self._inventory = generation, ids

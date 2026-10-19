@@ -324,17 +324,52 @@ before retiring fixed memory charges. Ordinary load/unload, slot-file and VRAM
 controls are gated too. Failed export or protocol framing leaves the lane gated;
 protocol failure does not kill the engine or permit a legacy restore retry.
 
-Restoration currently uses a new ready compatible **unbatched** worker and its `lazy_restore` operation,
-selecting an ID from the published bundle. Admission remains gated until its owner
-reconciles restored state and registers valid resource ownership. This is a Python
-owner API, not an automatic signal handler, HTTP session router or 3-to-1 lane
-migration controller. Mapping agent identities to saved sessions and restoring
-directly into concurrent destination slots remain separate work. Slot files can
-restore into an unbatched lane only with the same model, context/KV layout and
-other state-compatible configuration. Checkpoints preserve reusable computational
-prefixes between requests. They do not save active-generation sampling/counters,
-the last emitted but not yet consumed token, cache pinning policy or a partial
-prompt's execution plan; they do not resume a sampled reply midway through it.
+Restoration supports a ready compatible unbatched worker through `lazy_restore`,
+or an empty slot in a compatible batch worker through
+`restore_slot(store, checkpoint_id, session_id, slot, timeout_s=30)`. The latter
+requires the separate native advertisement `INFO session_restore_batch=1`.
+`RESTORE_SLOT <slot> <path>` reads and validates the file against the destination
+slot before transfer. It does not use the live session as scratch space or evict
+another cached slot. A failed transfer quarantines the destination and keeps
+admission closed; other retained sessions stay loaded.
+
+Restore one or more selected sessions while admission is closed, then explicitly
+call `worker.resume(timeout_s=30)`. The worker checks native state, process identity,
+slot ownership and precision before reopening the same admission worker. Fixed
+memory charges and registration generation remain intact. A failed restore blocks
+resume. The native response supplies the exact retained token IDs in bounded
+chunks, so ordinary prefix matching can route the next prompt back to its restored
+slot. These IDs are internal protocol data and must not be logged as user-facing
+status. Published checkpoint files remain available after restoration.
+
+For example, with two selected session IDs and a ready batch destination:
+
+```python
+store = CheckpointStore(checkpoint_directory)
+worker = NativeLaneWorker(destination_service, model_identity, enabled=True)
+for slot, session_id in enumerate(selected_session_ids):
+    result = worker.restore_slot(store, checkpoint_id, session_id, slot)
+    if result.state != "restored":
+        raise RuntimeError(result.error)  # leave gated; do not reopen manually
+result = worker.resume()
+if result.state != "resumed":
+    raise RuntimeError(result.error)
+```
+
+The owner chooses the source session and destination slot. This is a Python owner
+API, not an automatic signal handler, HTTP session router or 3-to-1 lane migration
+controller. Agent-to-checkpoint ownership routing remains separate work. Restore
+requires the same model, context/KV layout and other state-compatible configuration.
+Existing cached slots are not overwritten; unused slots must already exist in the
+configured batch, with their residency included in calibrated fixed memory costs.
+The fixed host budget must also cover the peak full checkpoint read image and
+retained host checkpoints during restore. The native available-RAM floor provides
+a second check; it does not reserve that scratch space in the resource ledger.
+Requests after resume still pass the usual per-request resource admission checks.
+Checkpoints preserve reusable computational prefixes between requests. They do not
+save active-generation sampling/counters, the last emitted but not yet consumed
+token, cache pinning policy or a partial prompt's execution plan; they do not resume
+a sampled reply midway through it.
 
 ## Validation
 
@@ -343,7 +378,7 @@ From the repository root, run the CPU-only suites relevant to these components:
 ```sh
 python -m pip install jinja2==3.1.6 pytest==8.4.2
 python -m pytest -q tools/test_model_manifest.py serve/test_backends.py tools/test_backend_preflight.py serve/test_precision_policy.py serve/test_runtime_precision.py serve/test_resource_admission.py serve/test_request_admission.py serve/test_lane_lifecycle.py
-python -m pytest -q serve/test_slot_drain.py serve/test_session_protocol.py serve/test_native_lane.py serve/test_native_lane_controls.py serve/test_batch_checkpoint.py
+python -m pytest -q serve/test_slot_drain.py serve/test_session_protocol.py serve/test_native_lane.py serve/test_native_lane_controls.py serve/test_batch_checkpoint.py serve/test_batch_restore.py
 python -m pytest -q serve/test_quiet_cancel.py serve/test_request_accounting.py serve/test_replicas.py serve/test_lifecycle.py
 ```
 
@@ -368,8 +403,8 @@ continuation equivalence before enabling this on a serving lane.
 2. Qualify per-slot drain receipts on an isolated runner lane and calibrate peak
    reservations before extending beyond the single-lane text-only scope.
 3. Harden shared expert-store publication/attach semantics with immutable identity.
-4. Build every affected GPU backend and qualify batch export/unbatched restore;
-   then add destination-slot restoration and agent-to-checkpoint ownership routing.
+4. Build every affected GPU backend and qualify batch export and destination-slot
+   restoration; then add agent-to-checkpoint ownership routing.
 5. Qualify another architecture and, with the benchmark runner, useful deep-context
    concurrency and lane-count transitions. A generic metadata type is not support
    for another model's executor or state format.

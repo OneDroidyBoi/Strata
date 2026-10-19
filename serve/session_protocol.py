@@ -127,3 +127,55 @@ class SessionProtocol:
         except Exception:
             self.engine._session_protocol_failed = True
             raise
+
+    def restore_slot(self, slot, path):
+        """Restore an empty slot and receive its exact routing prefix in chunks."""
+        from serve.server import SessionRefused
+        if (getattr(self.engine, 'session_batch_restore', False) is not True
+                or type(slot) is not int or not 0 <= slot < getattr(self.engine, 'batch', 0)):
+            raise ValueError('unadvertised or invalid native restore slot')
+        if not isinstance(path, str) or not path or any(c in path for c in '\r\n\0'):
+            raise ValueError('invalid restore path')
+        limit = getattr(self.engine, 'max_context', 0)
+        if type(limit) is not int or limit <= 0:
+            raise ValueError('native restore context limit is unavailable')
+        try:
+            self._start(f'RESTORE_SLOT {slot} {path}')
+            deadline = time.monotonic() + self.timeout
+            ids, last_done, last_total = [], -1, None
+            while True:
+                fields = self._read(deadline)
+                if len(fields) == 3 and fields[0] == 'SESSION':
+                    done, total = _count(fields[1]), _count(fields[2])
+                    if ids or done < last_done or done > total or (last_total is not None and total != last_total):
+                        raise SessionProtocolError('invalid native restore progress')
+                    if done > last_done:
+                        deadline = time.monotonic() + self.timeout
+                    last_done, last_total = done, total
+                elif len(fields) == 3 and fields[0] == 'SWAIT':
+                    from serve.server import SESSION_WAIT_MAX_S
+                    seconds = _count(fields[2])
+                    if (ids or not fields[1].isascii() or not fields[1].isalpha()
+                            or not 0 < seconds <= SESSION_WAIT_MAX_S):
+                        raise SessionProtocolError('invalid native blocking phase')
+                    deadline = time.monotonic() + max(self.timeout, seconds)
+                elif len(fields) == 3 and fields[0] == 'SLOT_IDS':
+                    if fields[1] != str(slot):
+                        raise SessionProtocolError('native restore slot mismatch')
+                    chunk = [_count(value) for value in fields[2].split(',')]
+                    if len(ids) + len(chunk) > limit or any(value > 2147483647 for value in chunk):
+                        raise SessionProtocolError('native restored prefix exceeds limits')
+                    ids.extend(chunk)
+                    deadline = time.monotonic() + self.timeout
+                elif len(fields) == 5 and fields[0] == 'SLOT_RESTORED':
+                    tokens, size, ms = _count(fields[2]), _count(fields[3]), float(fields[4])
+                    if fields[1] != str(slot) or tokens != len(ids) or not math.isfinite(ms) or ms < 0:
+                        raise SessionProtocolError('invalid native slot restore completion')
+                    return {'tokens': tokens, 'bytes': size, 'ms': ms, 'ids': ids}
+                else:
+                    raise SessionProtocolError('unexpected native slot restore response')
+        except SessionRefused:
+            raise
+        except Exception:
+            self.engine._session_protocol_failed = True
+            raise

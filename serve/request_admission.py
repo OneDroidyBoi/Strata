@@ -136,6 +136,14 @@ class RequestAdmission:
     def gate_admission(self):
         self.ledger.begin_drain(self.worker)
 
+    def resume_admission(self):
+        """Owner-validated resume; never discard or replace existing leases.
+
+        A late failed drain receipt may conservatively gate this lane again.
+        Resuming cannot suppress receipt failures or confirm native readiness.
+        """
+        self.ledger.reopen_worker(self.worker)
+
     def wait_drained(self, timeout_s=0):
         return self.ledger.wait_quiescent(self.worker, timeout=timeout_s)
 

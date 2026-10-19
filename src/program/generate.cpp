@@ -10498,7 +10498,7 @@ int main(int argc, char** argv) {
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "",
-                        session_export_batch ? " session_export=1 session_export_batch=1" :
+                        session_export_batch ? " session_export=1 session_export_batch=1 session_restore_batch=1" :
                         session_export_enabled ? " session_export=1" : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
@@ -11326,7 +11326,7 @@ int main(int argc, char** argv) {
             const bool inventory_command = line == "INVENTORY";
             const bool export_command = line.rfind("EXPORT ", 0) == 0;
             const strata::core::SavedConversation* export_parked = nullptr;
-            int export_slot = -1;
+            int export_slot = -1, restore_slot = -1;
             if (session_export_enabled && !inventory_command && !export_command) session_inventory.invalidate();
             if (inventory_command || export_command) {
                 auto inventory_error = [&](const std::string& why) {
@@ -11383,6 +11383,34 @@ int main(int argc, char** argv) {
                     for (size_t b = 0; b < bs.size(); ++b)
                         if (key == "slot-" + std::to_string(b)) export_slot = (int) b;
                 line = "SAVE " + line.substr(second + 1);
+            }
+            if (line.rfind("RESTORE_SLOT", 0) == 0) {
+                try {
+                    std::string restore_path, why;
+                    size_t target = 0;
+                    if (!strata::core::session_slot_restore_parse(line, bs.size(), target, restore_path, why)) {
+                        std::printf("SERR invalid 0 %s\n", why.c_str()); std::fflush(stdout); continue;
+                    }
+                    std::vector<strata::core::SessionInventorySlot> slots;
+                    for (size_t b = 0; b < bs.size(); ++b) {
+                        const auto& sl = bs[b];
+                        const bool valid = bslot_ss.size() == 1 && b < bslot_ss[0].size() && bslot_ss[0][b] != nullptr;
+                        slots.push_back({b, sl.ids.size(), sl.checks.size(), sl.active, sl.cached,
+                                         sl.partial, sl.tainted, sl.img, valid});
+                    }
+                    const auto& target_slot = bs[target];
+                    const bool empty = !target_slot.stop && !target_slot.draft_ready && target_slot.p == 0 &&
+                                       target_slot.x == 0 && target_slot.produced == 0 && target_slot.max_new == 0;
+                    if (!strata::core::session_slot_restore_ready(slots, target,
+                            session_export_batch && !nan_flush, empty, why)) {
+                        std::printf("SERR invalid 0 %s\n", why.c_str()); std::fflush(stdout); continue;
+                    }
+                    restore_slot = (int) target;
+                    line = "RESTORE " + restore_path;
+                } catch (const std::bad_alloc&) {
+                    std::printf("SERR memory 0 not enough RAM to inspect restore target\n");
+                    std::fflush(stdout); continue;
+                }
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
@@ -11510,7 +11538,7 @@ int main(int argc, char** argv) {
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
-                if (o.batch > 0 && !export_command) { refuse("session files do not support --batch (parallel requests)"); continue; }
+                if (o.batch > 0 && !export_command && restore_slot < 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
@@ -11658,6 +11686,7 @@ int main(int argc, char** argv) {
                                  path.c_str(), ms(), capture_ms);
                     std::printf("SAVED %zu %zu %.1f\n", save_ids.size(), bytes, ms());
                 } else {
+                    auto& restore_ss = restore_slot >= 0 ? *bslot_ss[0][(size_t) restore_slot] : ss;
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
                     try {
@@ -11677,7 +11706,7 @@ int main(int argc, char** argv) {
                             return false;
                         };
                         if (!strata::core::conversation_session_read_limits(
-                                limits, ss, g, (use_mtp || !session_export_enabled) ? &mtp.kv_state() : nullptr, (uint64_t) o.max_context,
+                                limits, restore_ss, g, (use_mtp || !session_export_enabled) ? &mtp.kv_state() : nullptr, (uint64_t) o.max_context,
                                 (uint64_t) std::max(o.prompt_cache, 1), err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -11694,9 +11723,47 @@ int main(int argc, char** argv) {
                     const double read_ms = ms();
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, (use_mtp || !session_export_enabled) ? &mtp.kv_state() : nullptr, err)) {
+                    if (!strata::core::conversation_snapshot_validate(image, restore_ss, g, (use_mtp || !session_export_enabled) ? &mtp.kv_state() : nullptr, err)) {
                         refuse(err);
                         continue;
+                    }
+                    if (restore_slot >= 0) {
+                        // No main-session mounting and no K/V growth: this slot must already fit the validated image.
+                        if (image.live.ids.empty() || !image.live.imgs.empty() || std::any_of(image.live.ids.begin(), image.live.ids.end(),
+                                [&](int32_t token) { return token < 0 || token >= n_vocab; })) {
+                            refuse("slot restore needs a text-only prefix with valid token IDs"); continue;
+                        }
+                        blocking("transfer", bytes);
+                        const auto restored = strata::core::conversation_snapshot_restore(image, restore_ss, g,
+                                                                                            nullptr, err);
+                        auto& slot = bs[(size_t) restore_slot];
+                        if (restored != strata::core::ConversationRestore::restored) {
+                            // Keep every other session alive. A partially written target is never reusable or
+                            // omitted by inventory: its quarantine makes a later graceful shutdown fail closed.
+                            if (restored == strata::core::ConversationRestore::transfer_failed) slot.tainted = true;
+                            slot.cached = false;
+                            refuse("slot restore failed; target unavailable: " + err,
+                                   restored == strata::core::ConversationRestore::transfer_failed ?
+                                   strata::core::SessionError::io : strata::core::SessionError::invalid);
+                            continue;
+                        }
+                        slot.ids = std::move(image.live.ids);
+                        slot.checks = std::move(image.checkpoints);
+                        for (const auto& checkpoint : slot.checks) check_clock = std::max(check_clock, checkpoint.used);
+                        slot.cvec = image.cvec;
+                        slot.p = (int64_t) slot.ids.size();
+                        slot.cached = true;
+                        // Full consumed prefix, never the unconsumed final emitted token. Bound each protocol line
+                        // to 256 signed-int32 values (<3 KiB), including at maximum model context.
+                        for (size_t first = 0; first < slot.ids.size(); first += 256) {
+                            std::printf("SLOT_IDS %d ", restore_slot);
+                            const size_t last = std::min(slot.ids.size(), first + 256);
+                            for (size_t i = first; i < last; ++i)
+                                std::printf("%s%d", i == first ? "" : ",", (int) slot.ids[i]);
+                            std::printf("\n");
+                        }
+                        std::printf("SLOT_RESTORED %d %zu %zu %.1f\n", restore_slot, slot.ids.size(), bytes, ms());
+                        std::fflush(stdout); continue;
                     }
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
                     if (!kvg_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce)) {

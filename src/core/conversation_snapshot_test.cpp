@@ -210,6 +210,20 @@ void full_session(int fmt, int mode, int experts) {
         for(size_t j=0;j<slot_before.kv.size();++j)
             check(equal(slot_before.kv[j],target_after.kv[j]) && equal(slot_before.kv[j],slot_after.kv[j]),
                   "slot KV preserved and independently restored");
+        // A malformed restore is rejected before touching the destination or its independent source slot.
+        // Runtime ownership/empty-target checks are CPU-tested; this checks the actual device preflight barrier.
+        auto invalid_slot = slot_file;
+        invalid_slot.live.gdn.pop_back();
+        check(conversation_snapshot_restore(invalid_slot,target_ss,g,nullptr,err)==ConversationRestore::invalid,
+              "invalid slot restore refused before device writes");
+        SavedConversation target_after_refusal, source_after_refusal;
+        check(conversation_snapshot_save(target_after_refusal,view,target_ss,g,nullptr,err) &&
+              conversation_snapshot_save(source_after_refusal,view,ss,g,nullptr,err),"capture after refused slot restore");
+        check(same_running(target_after,target_after_refusal) && same_running(slot_before,source_after_refusal),
+              "refused restore preserves destination and neighboring session recurrent state");
+        for(size_t j=0;j<slot_before.kv.size();++j)
+            check(equal(target_after.kv[j],target_after_refusal.kv[j]) &&
+                  equal(slot_before.kv[j],source_after_refusal.kv[j]),"refused restore preserves neighboring KV");
         std::error_code ec;
         fs::remove_all(dir,ec);
         auto empty_ids=std::vector<int32_t>{};

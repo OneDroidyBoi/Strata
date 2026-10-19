@@ -2239,6 +2239,15 @@ class StrataEngine:
     def session_batch_export(self):
         return self.session_lifecycle and self.info.get('session_export_batch') in ('1', 1)
 
+    @property
+    def session_batch_restore(self):
+        return self.session_batch_export and self.info.get('session_restore_batch') in ('1', 1)
+
+    def session_restore_slot(self, slot, path):
+        """Restore an empty slot; caller gates admission and holds FIFO plus ctl."""
+        from serve.session_protocol import SessionProtocol
+        return SessionProtocol(self).restore_slot(slot, str(path))
+
     def session_inventory(self):
         """Enumerate state; caller gates admission and holds FIFO plus batch ctl."""
         from serve.session_protocol import SessionProtocol

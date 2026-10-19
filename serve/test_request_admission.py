@@ -545,3 +545,42 @@ def test_failure_racing_confirmation_still_gates_after_release():
     assert controller.ledger.snapshot()['workers']['lane']['draining']
     with pytest.raises(AdmissionRejected, match='draining'):
         controller.acquire(1, 1)
+
+
+def test_resume_keeps_controller_generation_and_residency_after_full_drain():
+    controller = RequestAdmission(config())
+    handle = controller.worker
+    ledger = controller.ledger
+    lease = controller.acquire(1, 1)
+    controller.gate_admission()
+    with pytest.raises(AdmissionRejected):
+        controller.resume_admission()
+    ledger.release(lease, iterator_closed=True, work_drained=True)
+    controller.resume_admission()
+    assert controller.worker == handle
+    assert controller.ledger is ledger
+    assert ledger.snapshot()['host_bytes'] == 10
+    replacement = controller.acquire(1, 1)
+    assert not ledger.release(lease, iterator_closed=True, work_drained=True)
+    assert ledger.snapshot()['active_reservations'] == 1
+    ledger.release(replacement, iterator_closed=True, work_drained=True)
+
+
+def test_stale_failed_receipt_after_resume_only_regates_never_releases_new_work():
+    controller = RequestAdmission(config())
+    receipt = ControlledDrainReceipt()
+    assert list(controller.run(lambda: (item for item in []), 1, 1,
+                               drain_receipt=receipt)) == []
+    controller.gate_admission()
+    controller.resume_admission()
+    new_lease = controller.acquire(1, 1)
+    used = controller.ledger.snapshot()['host_bytes']
+    receipt.mark_failed()
+    assert controller.ledger.snapshot()['host_bytes'] == used
+    assert controller.ledger.snapshot()['active_reservations'] == 1
+    assert controller.ledger.snapshot()['workers']['lane']['draining']
+    with pytest.raises(AdmissionRejected, match='draining'):
+        controller.acquire(1, 1)
+    with pytest.raises(AdmissionRejected):
+        controller.resume_admission()
+    controller.ledger.release(new_lease, iterator_closed=True, work_drained=True)

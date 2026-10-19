@@ -140,6 +140,19 @@ class ResourceLedger:
             self._worker(handle).draining = True
             self._condition.notify_all()
 
+    def reopen_worker(self, handle):
+        """Explicitly resume the same registered worker after a complete drain.
+
+        This does not validate engine/checkpoint readiness: the lifecycle owner
+        must do so before calling. Fixed residency and generation stay intact.
+        """
+        with self._condition:
+            worker = self._worker(handle)
+            if not worker.draining or worker.active:
+                raise AdmissionRejected("worker must be draining and quiescent before resume")
+            worker.draining = False
+            self._condition.notify_all()
+
     def wait_quiescent(self, handle, timeout=0):
         """Wait at most 60 seconds for leases to release; never cancels work."""
         if (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or

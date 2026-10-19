@@ -7,7 +7,7 @@ import tempfile
 import threading
 import unittest
 
-from serve.backends import ModelIdentity
+from serve.backends import ModelIdentity, SessionMetadata
 from serve.checkpoint_store import CheckpointStore
 from serve.native_lane import NativeLaneWorker
 from serve.request_admission import RequestAdmission
@@ -89,6 +89,7 @@ class Engine:
 class BatchEngine(Engine):
     batch = 2
     session_batch_export = True
+    session_batch_restore = True
     slot_groups = 1
 
     def __init__(self, model, fifo):
@@ -112,6 +113,14 @@ class BatchEngine(Engine):
     def session_export(self, generation, sid, path):
         assert self.ctl.locked()
         return super().session_export(generation, sid, path)
+
+    def session_restore_slot(self, slot, path):
+        assert self.fifo.locked() and self.ctl.locked()
+        ids = [int(i) for i in Path(path).read_text().split(',')]
+        self.restores.append((slot, ids))
+        self.generation = f'process1-restored{len(self.restores)}'
+        self.entries.append({'id': f'slot-{slot}', 'kind': 'slot', 'tokens': len(ids)})
+        return {'tokens': len(ids), 'bytes': Path(path).stat().st_size, 'ms': 1.0, 'ids': ids}
 
     def close(self):
         assert self.ctl.locked()
@@ -413,6 +422,103 @@ class NativeBatchLaneTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 NativeLaneWorker(service, self.model, enabled=True)
             self.assertEqual(service.engine.inventory_calls, 0)
+
+
+class NativeSlotRestoreTests(unittest.TestCase):
+    batch_lane = NativeBatchLaneTests.batch_lane
+    def setUp(self):
+        NativeLaneTests.setUp(self)
+        self.ready, self.restore_worker = self.batch_lane()
+        self.ready.engine.entries = [e for e in self.ready.engine.entries if e['kind'] != 'slot']
+        self.ready.engine.slot_held = [[], []]
+        sessions = [SessionMetadata('source-a', self.model), SessionMetadata('source-b', self.model)]
+        self.bundle = self.store.publish(self.model, sessions,
+            lambda session, path: path.write_text('1,2,3' if session.session_id == 'source-a' else '4,5'))
+
+    def restore(self, session='source-a', slot=0):
+        return self.restore_worker.restore_slot(self.store, self.bundle, session, slot)
+
+    def test_distinct_slot_restore_and_explicit_resume_retains_fixed_costs(self):
+        other = deepcopy(self.ready.engine.entries)
+        self.assertEqual(self.restore().state, 'restored')
+        self.assertEqual(self.restore('source-b', 1).state, 'restored')
+        self.assertEqual([e for e in self.ready.engine.entries if e['kind'] != 'slot'], other)
+        self.assertEqual(self.ready.engine.slot_held, [[1, 2, 3], [4, 5]])
+        with self.assertRaises(AdmissionRejected):
+            self.ready.request_admission.acquire(1, 1)
+        resumed = self.restore_worker.resume()
+        self.assertEqual(resumed.state, 'resumed', resumed.error)
+        self.assertFalse(self.ready.native_lane_gated)
+        self.assertEqual(self.ready.request_admission.ledger.snapshot()['host_bytes'], 10)
+        lease = self.ready.request_admission.acquire(1, 1)
+        self.ready.request_admission.ledger.release(lease, iterator_closed=True, work_drained=True)
+        self.assertFalse(self.ready.fifo.locked())
+        self.assertFalse(self.ready.engine.ctl.locked())
+
+    def test_failed_restore_that_changes_other_state_cannot_resume(self):
+        original = self.ready.engine.session_restore_slot
+        def corrupt(*args):
+            reply = original(*args)
+            self.ready.engine.entries[0]['tokens'] += 1
+            return reply
+        self.ready.engine.session_restore_slot = corrupt
+        result = self.restore()
+        self.assertEqual(result.state, 'blocked')
+        self.assertIn('changed other state', result.error)
+        self.assertEqual(self.ready.engine.slot_held, [[], []])
+        self.assertEqual(self.restore_worker.resume().state, 'blocked')
+        with self.assertRaises(AdmissionRejected):
+            self.ready.request_admission.acquire(1, 1)
+        self.assertEqual(self.ready.engine.close_count, 0)
+        self.assertFalse(self.ready.fifo.locked())
+        self.assertFalse(self.ready.engine.ctl.locked())
+
+    def test_bad_acknowledgement_poison_prevents_retry_and_resume(self):
+        original = self.ready.engine.session_restore_slot
+        def bad_count(*args):
+            reply = original(*args)
+            reply['ids'] = [1]
+            return reply
+        self.ready.engine.session_restore_slot = bad_count
+        self.assertEqual(self.restore().state, 'blocked')
+        self.assertEqual(self.restore('source-b', 1).state, 'blocked')
+        self.assertEqual(self.restore_worker.resume().state, 'blocked')
+        self.assertEqual(len(self.ready.engine.restores), 1)
+        self.assertEqual(self.ready.engine.slot_held, [[], []])
+
+    def test_process_replacement_between_restores_blocks_without_dispatch(self):
+        self.assertEqual(self.restore().state, 'restored')
+        self.ready.engine.proc = Process()
+        self.ready.engine.gen += 1
+        result = self.restore('source-b', 1)
+        self.assertEqual(result.state, 'blocked')
+        self.assertIn('between gated', result.error)
+        self.assertEqual(len(self.ready.engine.restores), 1)
+        self.assertEqual(self.restore_worker.resume().state, 'blocked')
+
+    def test_resume_without_verified_restore_never_reopens_admission(self):
+        result = self.restore_worker.resume()
+        self.assertEqual(result.state, 'blocked')
+        self.assertTrue(self.ready.native_lane_gated)
+        with self.assertRaises(AdmissionRejected):
+            self.ready.request_admission.acquire(1, 1)
+
+    def test_invalid_slot_precheck_also_gates_and_blocks_resume(self):
+        result = self.restore(slot=-1)
+        self.assertEqual(result.state, 'blocked')
+        self.assertTrue(self.ready.native_lane_gated)
+        self.assertEqual(self.ready.engine.restores, [])
+        with self.assertRaises(AdmissionRejected):
+            self.ready.request_admission.acquire(1, 1)
+        self.assertEqual(self.restore_worker.resume().state, 'blocked')
+
+    def test_inventory_or_routing_changes_after_restore_block_resume(self):
+        self.assertEqual(self.restore().state, 'restored')
+        self.ready.engine.slot_held[0] = [8, 9, 10]
+        result = self.restore_worker.resume()
+        self.assertEqual(result.state, 'blocked')
+        self.assertIn('routing state changed', result.error)
+        self.assertTrue(self.ready.native_lane_gated)
 
 
 if __name__ == '__main__':

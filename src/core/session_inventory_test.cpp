@@ -65,6 +65,37 @@ int main() {
         entries = {{"live", "live", 10}};
         assert(!session_inventory_append_slots(bad, entries, error) && entries.empty());
     }
+    size_t target = 99;
+    std::string restore_path;
+    assert(session_slot_restore_parse("RESTORE_SLOT 1 /tmp/a path.bin", 2, target, restore_path, error));
+    assert(target == 1 && restore_path == "/tmp/a path.bin");
+    for (const auto& command : {"RESTORE_SLOT", "RESTORE_SLOT 0", "RESTORE_SLOT 0 ",
+            "RESTORE_SLOT -1 x", "RESTORE_SLOT +1 x", "RESTORE_SLOT 01 x", "RESTORE_SLOT 2 x",
+            "RESTORE_SLOT 0junk x", "RESTORE_SLOT 9999999999999999999999999 x"})
+        assert(!session_slot_restore_parse(command, 2, target, restore_path, error));
+    assert(!session_slot_restore_parse(std::string("RESTORE_SLOT 1 /tmp/a") + '\0' + "b", 2,
+                                       target, restore_path, error));
+    // Slot zero remains cached while an independent empty slot is restored.
+    assert(session_slot_restore_ready(slots, 1, true, true, error));
+    assert(!session_slot_restore_ready(slots, 0, true, true, error));
+    assert(!session_slot_restore_ready(slots, 2, true, true, error));
+    assert(!session_slot_restore_ready(slots, 1, false, true, error));
+    assert(!session_slot_restore_ready(slots, 1, true, false, error));
+    for (int mode = 0; mode < 7; ++mode) {
+        auto busy = slots;
+        if (mode == 0) busy[0].active = true;
+        if (mode == 1) busy[0].partial = true;
+        if (mode == 2) busy[1].tainted = true;
+        if (mode == 3) busy[1].images = true;
+        if (mode == 4) busy[1].checkpoints = 1;
+        if (mode == 5) busy[1].layout_valid = false;
+        if (mode == 6) busy[1].cached = true;
+        assert(!session_slot_restore_ready(busy, 1, true, true, error));
+    }
+    auto quarantined = slots;
+    quarantined[1].tainted = true; // partial GPU transfer cannot silently disappear from inventory.
+    assert(!session_inventory_append_slots(quarantined, entries, error) && entries.empty());
+    assert(slots[0].cached && slots[0].tokens == 8 && !slots[1].tainted);
     std::filesystem::remove(path);
     std::cout << "session inventory tests passed\n";
 }
