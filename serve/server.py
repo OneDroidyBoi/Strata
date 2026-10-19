@@ -792,6 +792,14 @@ class StrataEngine:
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
+        # Opt-in policy checks the actual child environment and payloads before even a lazy
+        # instance or log is created. restart() re-enters here: no cached audit authorizes it.
+        from serve.precision_policy import enforce_launch_policy
+        checked_env = dict(os.environ if env is None else env)
+        self.precision_policy_report = enforce_launch_policy(args, cwd or os.getcwd(), checked_env)
+        # With enforcement enabled, spawn exactly the environment that was checked. Keep
+        # the original env in self.spawn so inherited environments are re-read on restart.
+        launch_env = checked_env if self.precision_policy_report is not None else env
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
@@ -840,7 +848,7 @@ class StrataEngine:
             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
         spawned_at = time.monotonic()
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
+                          stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=launch_env, **pin)
         contain(self.proc)                               # ends with the server, however it ends (Windows)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
@@ -3120,6 +3128,7 @@ class Service:
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
+        self.request_admission = None                # opt-in peak-cost reservations
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
@@ -4180,7 +4189,24 @@ class Service:
         if ka is not None:
             ka.acquire()
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force)
+            admission = getattr(self, 'request_admission', None)
+            if admission is None:
+                yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force)
+            else:
+                from serve.resource_admission import AdmissionRejected
+                def drained():
+                    # _run closes/drains its native iterator before returning.
+                    # A timed-out kill is not proof that device work has stopped.
+                    proc = getattr(self.engine, 'proc', None)
+                    return self.engine.alive() or (proc is not None and proc.poll() is not None)
+                try:
+                    if getattr(self.engine, 'batch', 0):
+                        raise AdmissionRejected('batched admission needs per-slot drain acknowledgements')
+                    yield from admission.run(
+                        lambda: self._run(ids, thinking, tools, max_new, sampling, cancel, force),
+                        len(ids), max_new, drained)
+                except AdmissionRejected as exc:
+                    raise EngineDied(f'resource admission rejected this request: {exc}') from exc
         finally:
             if ka is not None:
                 ka.release()
@@ -6853,6 +6879,14 @@ def main() -> int:
         cfg["replicas"] = a.replicas
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
+    from serve.request_admission import configured_admission
+    try:
+        admission = configured_admission(cfg, gpu_list(cfg)) if 'resource_admission' in cfg else None
+        if admission is not None and any(
+                arg == '--batch' or arg.startswith('--batch=') for arg in engine_args(cfg)):
+            raise ValueError('resource_admission does not yet support batched native drain')
+    except (ValueError, RuntimeError) as exc:
+        ap.error(str(exc))
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
@@ -6879,6 +6913,8 @@ def main() -> int:
             ap.error("--engine strata needs --config")
         vision = None
         env = child_env(cfg)
+        if 'STRATA_PRECISION_POLICY' in env and (cfg.get('vision') or cfg.get('images')):
+            ap.error('strict precision policy does not yet audit vision/image sidecars')
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
@@ -6948,6 +6984,7 @@ def main() -> int:
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    svc.request_admission = admission
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
     svc.answer_room = cfg.get("answer_room") is not False

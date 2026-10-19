@@ -2,16 +2,14 @@ name: Backend foundation (CPU only)
 on:
   push:
     paths:
-      - 'serve/backends/**'
-      - 'serve/test_backends.py'
+      - 'serve/**'
       - 'tools/*manifest*.py'
       - 'tools/*backend_preflight.py'
       - 'tools/gguf_reader.py'
       - '.github/workflows/backend-foundation.yml'
   pull_request:
     paths:
-      - 'serve/backends/**'
-      - 'serve/test_backends.py'
+      - 'serve/**'
       - 'tools/*manifest*.py'
       - 'tools/*backend_preflight.py'
       - 'tools/gguf_reader.py'
@@ -30,4 +28,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Validate synthetic artifacts and adapter contracts
-        run: python -m unittest tools.test_model_manifest serve.test_backends tools.test_backend_preflight
+        run: |
+          python -m pip install jinja2==3.1.6 pytest==8.4.2
+          python -m pytest -q tools/test_model_manifest.py serve/test_backends.py tools/test_backend_preflight.py serve/test_precision_policy.py serve/test_runtime_precision.py serve/test_resource_admission.py serve/test_request_admission.py serve/test_lane_lifecycle.py
+      - name: Check existing serving behavior with local fake engines
+        run: python -m pytest -q serve/test_quiet_cancel.py serve/test_request_accounting.py serve/test_replicas.py serve/test_lifecycle.py

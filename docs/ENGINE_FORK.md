@@ -4,7 +4,7 @@ This fork starts from upstream Strata commit
 `477ac13cbe8e582c20484871ce459d20d82df09d`. It is an experimental development
 branch, not a replacement for an installed Strata server.
 
-## What this first change does
+## What this foundation does
 
 - Adds an opt-in backend interface and a thin adapter around an already-created
   Strata engine. The adapter delegates generation; it does not implement another
@@ -15,10 +15,16 @@ branch, not a replacement for an installed Strata server.
 - Adds a combined offline preflight report, joining artifact precision results
   with the adapter's declared capabilities. Passing this report is not proof of
   numerical correctness, model completeness, kernel support or memory fit.
+- Enforces an optional precision policy before native construction and restart,
+  and explicit resource reservations around the supported request path.
+- Adds durable checkpoint storage and an injected-worker persist-and-stop
+  lifecycle; native all-session export remains a separate implementation gate.
 
-No existing server startup, model loader, CUDA/HIP/SYCL kernel, or default
-generation path is changed. The normal server does not automatically enforce
-the new manifest. Integration into actual model admission is a later change.
+The backend adapter, launch precision policy, resource ledger and checkpoint
+controller are separate opt-in components. None changes numerical kernels or
+qualifies a new model executor. Runtime policy hooks must use the actual launch
+arguments and child environment on every spawn, including restarts; an offline
+preflight report alone does not enforce a running server.
 
 ## Why start here
 
@@ -107,35 +113,218 @@ stream = backend.generate(token_ids, max_new, sampling, cancel_event, session=se
 The caller still owns engine loading, resource admission, locks and draining.
 The adapter does not make a single-session engine concurrent.
 
-## Validation
+## Launch precision enforcement
 
-From the repository root:
+`serve.precision_policy.enforce_launch_policy(args, cwd, env)` returns `None`
+when `STRATA_PRECISION_POLICY` is absent. When set, it freshly validates a JSON
+policy and the actual launch, returning an enforcement report or raising
+`PrecisionPolicyError` before process creation. `args` contains engine arguments,
+not the executable; `env` must be the merged environment the child will receive.
+The caller must invoke it on every spawn, including automatic restart.
 
-```sh
-python -m unittest tools.test_model_manifest serve.test_backends tools.test_backend_preflight
+A policy file has this shape; paths are relative to the policy file:
+
+```json
+{
+  "schema_version": 1,
+  "target": ["model-00001-of-00002.gguf", "model-00002-of-00002.gguf"],
+  "pack": "pack",
+  "ple": "embedded",
+  "draft": "disabled",
+  "minimum_bits": 4,
+  "preferred_bits": 8
+}
 ```
 
-The initial suite has 36 passing tests on Python 3.12.14, using synthetic GGUF
-files and fake engines. Coverage includes low-bit draft rejection, unknown
-tensor roles, shard completeness, malformed headers, payload extents, optional
-hashing, input overwrite prevention, iterator cleanup, cancellation and explicit
-unsupported operations. CI is configured for Python 3.10 and 3.12 on a CPU runner.
-No CUDA/HIP/SYCL files were changed or GPU backend builds run.
+For external PLE, replace `embedded` with the standalone table GGUF path and bind
+it explicitly in the launch using `--ple-gguf`. Optional `sha256` maps admitted
+artifact paths to expected full-file digests. A Q8 minimum can be requested with
+`minimum_bits: 8`; Q8 preference alone does not prohibit Q4.
+
+This guard admits a deliberately narrow native-pack subset. It binds the native
+shard set, pack path, PLE source and explicit disabled draft. It verifies native
+expert descriptors and packed float payloads against audited source spans or
+reviewed float conversions. Opaque overriding runtime payloads, unreviewed
+options/environment overrides and lower-bit weights fail closed. This is why an
+otherwise legitimate upstream configuration may be refused: support must be
+reviewed before widening the allowlist, not bypassed by ignoring its error.
+
+The current learned MTP pack is below the strict Q4 floor and is not admitted.
+Strict-policy startup also rejects vision/image sidecars before constructing them;
+their weight sources need separate auditing before that combination is supported.
+The guard does not establish kernel compatibility, Q8 fit or original numerical
+provenance. Files must remain immutable throughout validation and execution;
+this is not protection against a concurrent local writer replacing files after
+checking them. Large pack verification can perform substantial disk reads, so
+it must not be run during another lane's timed benchmark without coordination.
+
+## Resource admission
+
+`serve.resource_admission.ResourceLedger(host_bytes, gpu_bytes)` provides
+process-local reservations. `gpu_bytes` maps GPU IDs to configured byte budgets.
+Its public sequence is:
+
+1. `register_worker(worker_id, gpu_id, max_slots, fixed_host_bytes, fixed_gpu_bytes)`
+   returns a generation-specific `WorkerHandle` and charges fixed costs.
+2. `acquire(handle, host_bytes, gpu_bytes, context_tokens)` atomically checks slot
+   and memory budgets and returns a `Reservation`, or raises `AdmissionRejected`.
+3. `release(reservation, iterator_closed=True, work_drained=True)` retires it only
+   after both conditions are positively established. Duplicate/stale/altered
+   reservations do not free another request's charge.
+4. `begin_drain(handle)` blocks new admissions. `wait_quiescent(handle, timeout)`
+   waits for outstanding reservations without cancelling work. `unregister_worker`
+   removes fixed costs only after draining and quiescence. The caller must also
+   confirm native shutdown before removing charges for actual resident memory.
+
+`snapshot()` supplies detached accounting data for diagnostics. The ledger does
+not inspect physical RAM/VRAM, constrain native allocations or coordinate other
+processes. Configured capacities must already exclude operating headroom and
+other workloads. Fixed costs must include retained/cached session state, loaded
+weights, preallocated slots and fixed scratch. Request costs cover incremental
+peaks, including copies; do not count a preallocated slot twice or release its
+resident memory charge when a request finishes.
+
+The server now wires `serve.request_admission.configured_admission` into
+`Service.run`. Enable it with the config key **`resource_admission`** (the module
+name is `request_admission`), with exactly these required fields:
+
+```text
+host_capacity_bytes, gpu_capacity_bytes, gpu_id, max_requests,
+fixed_host_bytes, fixed_gpu_bytes, host_request_bytes, gpu_request_bytes,
+host_bytes_per_token, gpu_bytes_per_token,
+max_context_tokens, lookahead_tokens
+```
+
+All byte/token/count fields must be explicit; `gpu_id` identifies the one GPU.
+There are no universal safe sample values. Calibrate fixed and per-request peaks
+for the exact model, precision, context and engine configuration before enabling
+it. The token budget includes prompt, permitted output and lookahead; per-token
+estimates multiply that budget in addition to base request costs. A nonpositive
+output limit reserves the configured maximum context. `RequestAdmission.run`
+closes its iterator and calls the supplied quiescence check before release; an
+uncertain drain or execution exception retains the reservation and gates further
+admission. Recovery requires explicit inspection; capacity is never silently reused.
+
+This first integration is **one GPU, one lane, text-only, unbatched execution**.
+Vision/images, replicas and native batching are rejected. Native batching can
+return before its background BDONE drain completes; supporting it requires a
+per-request completion acknowledgement tied to the reservation. The ledger can
+already account for concurrent workers, but this server hook does not yet qualify
+batched concurrency. It is a conservative rejection gate,
+not a GPU scheduler, a cross-process shared-memory broker or proof of physical
+fit. Holding a reservation until an HTTP iterator closes is insufficient if the
+engine still drains a batch slot in the background; native quiescence must be
+confirmed separately before release. Refuse unsupported combinations rather than
+quietly assuming their resource costs.
+
+## Durable storage and graceful lane lifecycle
+
+`serve.checkpoint_store.CheckpointStore(root)` requires an existing trusted local
+directory with no symlink traversal. The installer owns making that root durable.
+`publish(model, sessions, writer)` calls `writer(session, path)` for each exact
+`SessionMetadata`; the writer streams a backend-specific file. It never passes a
+whole model/state byte string through the controller. The store streams SHA256,
+fsyncs each payload, publishes a versioned JSON manifest by atomic rename, fsyncs
+the bundle directory, renames the staging bundle and fsyncs the root before
+reporting success. Failed staging directories remain for diagnosis and are not
+restorable published bundles.
+
+`store.sessions(checkpoint_id, model)` reads metadata. `store.restore(checkpoint_id,
+session_id, model, reader)` validates version, model identity, safe filenames,
+size and checksum before invoking `reader(session, path)`. Only the requested
+payload is read for lazy restoration. Published bundles must remain immutable.
+Checksums detect accidental corruption; they do not authenticate an untrusted
+writer or prove that a backend exported all required state. The store deliberately
+uses JSON rather than executable serialization. It caps manifest size and session
+count, but disk-capacity reservation and retention cleanup remain caller concerns.
+
+`serve.lane_lifecycle.LaneLifecycle(worker, store, model)` accepts an injected
+worker implementing:
+
+```text
+gate_admission()
+wait_drained(timeout_s) -> bool
+list_sessions() -> Sequence[SessionMetadata]
+export_session(session, path)
+unload()
+restore_session(session, path)
+```
+
+`persist_and_stop(timeout_s)` gates admission, waits for all device work and
+cancellation drains, enumerates every retained session, publishes the complete
+bundle, verifies that the inventory stayed unchanged, and only then calls
+`unload()`. The result has `state`, `checkpoint_id` and `error`. A timeout or export,
+checksum, disk, rename or fsync failure returns `blocked`; it does not force-cancel,
+kill or unload the worker. Admission remains gated for explicit operator recovery.
+An unloader/exporter may itself fail its worker, so `blocked` is not a guarantee
+that the worker is alive. An unload failure retains the durable bundle ID.
+
+`lazy_restore(checkpoint_id, session_id, timeout_s)` operates on a caller-provided
+ready worker, gates and drains it, validates the selected checkpoint and calls
+its restore method. It does not start a model or reopen admission. A failed native
+restore can have mutated state: `blocked` is not permission to resume serving or
+retry blindly. After a successful stop, construct a new lifecycle around the new
+ready worker rather than pretending the old process has restarted.
+
+### Native checkpoint gap and next step
+
+These are real disk/lifecycle components with injected-worker tests, **not an
+implemented native all-session migration adapter**. `StrataEngine.session_file`
+implements SAVE/RESTORE for the current conversation between requests while the
+caller holds the service FIFO. It does not enumerate/export every live, idle-slot
+and parked conversation. The backend adapter's durable-checkpoint and migration
+capabilities therefore remain false.
+
+The next native work must begin with an exact inventory API under the same
+admission gate and executor owner. Give each retained conversation a stable ID
+and list its target KV, recurrent/conv state, indexer state, PLE predecessor/history,
+sampling/RNG, checkpoint boundaries and any enabled draft state. Prove that no
+slot or parked branch is omitted. Then implement non-destructive export of each
+selected session using the existing native file machinery where its coverage is
+adequate. Export must leave other sessions intact and must include compatible
+model/layout/precision identities. A deliberately restricted one-conversation
+adapter is valid only when it enforces that there are no other retained sessions;
+it must not advertise general multi-session migration.
+
+Once that mapping is tested, graceful shutdown can gate new work, drain, check
+available disk space, persist every session, confirm durable publication and stop
+the process. Only after confirmed exit should the resource ledger remove fixed
+resident charges. On checkpoint failure, leave the lane gated and avoid teardown;
+on restore, load a compatible lane and restore sessions lazily as their owners
+return. Transcript replay is a cold reconstruction path, not warm state migration.
+
+## Validation
+
+From the repository root, run the CPU-only suites relevant to these components:
+
+```sh
+python -m pip install jinja2==3.1.6 pytest==8.4.2
+python -m pytest -q tools/test_model_manifest.py serve/test_backends.py tools/test_backend_preflight.py serve/test_precision_policy.py serve/test_runtime_precision.py serve/test_resource_admission.py serve/test_request_admission.py serve/test_lane_lifecycle.py
+python -m pytest -q serve/test_quiet_cancel.py serve/test_request_accounting.py serve/test_replicas.py serve/test_lifecycle.py
+```
+
+Tests use synthetic artifacts, fake engines and real temporary checkpoint files.
+They cover low-bit draft rejection, parser/identity validation, iterator cleanup,
+cancellation, accounting races and stale generations, partial writes, disk sync
+and rename failures, corrupt payloads, unsafe paths and restart/lazy restoration.
+Consult the current test output for counts. These tests do not qualify native
+checkpoint coverage, power-loss recovery on every filesystem, numerical execution,
+SM70 compatibility, Q8 fit or performance. No GPU backend build is implied.
 
 ## Next implementation gates
 
-1. Bind audited artifact identity and runtime transformations to actual model
-   admission, with a capability matrix for required operators and formats.
-2. Add resource reservations and worker/session generations around the existing
-   serving path, without changing numerical execution.
-3. Harden shared expert-store publication and attach semantics.
-4. Add complete backend-specific checkpoints and durable graceful lane shutdown.
-   A transcript is not a warm execution-state checkpoint.
-5. Qualify a second architecture early, then test useful two-session-per-GPU
-   concurrency and three-lane to one-lane transitions with the benchmark runner.
+1. Qualify the opt-in runtime hooks using actual launch and request inputs; keep
+   unsupported modes rejected and expose effective policies in status.
+2. Calibrate reservation estimates and retain them through confirmed native drain;
+   then extend beyond the initial single-lane text-only scope deliberately.
+3. Harden shared expert-store publication/attach semantics with immutable identity.
+4. Add exact native session inventory, per-session export and compatible restore,
+   then connect durable graceful shutdown to resource retirement.
+5. Qualify another architecture and, with the benchmark runner, useful deep-context
+   concurrency and lane-count transitions. A generic metadata type is not support
+   for another model's executor or state format.
 
-Keep GPU validation with the runner. CPU-side unit tests here do not establish
-SM70 compatibility, Q8 model fit, checkpoint durability or performance gains.
+Keep GPU validation with the runner and leave active benchmark lanes unchanged.
 
 ## Repository workflow
 
