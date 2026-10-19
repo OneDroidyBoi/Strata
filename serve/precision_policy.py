@@ -212,8 +212,9 @@ def _pack(pack, native_first, tensors, floor):
     dense_size = dense.stat().st_size
     dst_end = 0
     header = re.search(r'^# align (\d+) pool (\d+) tensors (\d+)$', index, re.MULTILINE)
-    if not header or int(header[1]) != 256:
-        _fail('index requires an explicit 256-byte aligned pool header')
+    if not header or int(header[1]) not in (64, 256):
+        _fail('index requires an explicit reviewed 64- or 256-byte aligned pool header')
+    alignment = int(header[1])
     for line in index.splitlines():
         if not line.strip() or line.startswith('#'):
             continue
@@ -233,7 +234,7 @@ def _pack(pack, native_first, tensors, floor):
             _fail(f'pack tensor shape mismatch: {name}')
         if fileid != 0 or dstoff != dst_end:
             _fail('index file id/pool offsets are outside standalone native subset')
-        dst_end += (dstsize + 255) // 256 * 256
+        dst_end += (dstsize + alignment - 1) // alignment * alignment
         if kind == 0:
             # A native placeholder must not smuggle actual verbatim quantized bytes.
             if (off, size, dstsize, codebits, bias, group, *tail) != (0, 0, 0, 8, 0, 32, *([0] * 7)):
@@ -250,7 +251,7 @@ def _pack(pack, native_first, tensors, floor):
         elements = math.prod(t.shape)
         if size != elements * M.GEOMETRY[storage][1] or dstsize != elements * M.GEOMETRY[runtime][1]:
             _fail('packed float payload byte count mismatch')
-        if off % 256 or off + size > dense_size:
+        if off % alignment or off + size > dense_size:
             _fail('packed float span is unaligned/truncated')
         if _converted_digest(h.path, h.data_start + t.offset, t.expected_bytes(), t.type_name, storage) != _slice_digest(dense, off, size):
             _fail(f'packed payload differs from audited source/conversion: {name}')

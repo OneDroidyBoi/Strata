@@ -64,6 +64,20 @@ class PrecisionLaunchTests(unittest.TestCase):
         self.assertTrue(result['pack_audit']['packed_payload_verified_against_source'])
         self.assertEqual(result['draft'], 'disabled')
 
+    def test_packer_64_alignment_and_pool_accounting(self):
+        path = self.pack / 'index.txt'
+        original = path.read_text()
+        path.write_text(original.replace('align 256 pool 512', 'align 64 pool 320')
+                        .replace('output.weight 0 0 0 0 512', 'output.weight 0 0 0 0 320'))
+        self.assertTrue(self.run_guard()['enforced'])
+        valid = path.read_text()
+        for bad in (valid.replace('align 64', 'align 32'),
+                    valid.replace('pool 320', 'pool 512'),
+                    valid.replace('norm.weight 0 2 256', 'norm.weight 0 2 257')):
+            path.write_text(bad)
+            with self.assertRaises(PrecisionPolicyError):
+                self.run_guard()
+
     def test_reaudits_on_every_call(self):
         self.run_guard()
         (self.pack / 'dense.bin').write_bytes(b'x' + bytes(511))
