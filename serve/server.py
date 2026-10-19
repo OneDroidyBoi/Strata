@@ -6848,6 +6848,11 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
     httpd.svc = svc
+    if gateway is not None:
+        # A client timeout does not cancel durable migration. Join managed HTTP
+        # handlers on server_close before the owner may close native workers.
+        # Unmanaged listeners retain ThreadingHTTPServer's daemon behavior.
+        httpd.daemon_threads = False
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 

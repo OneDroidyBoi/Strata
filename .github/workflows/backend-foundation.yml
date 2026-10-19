@@ -39,7 +39,7 @@ jobs:
         run: |
           python -m pip install jinja2==3.1.6 pytest==8.4.2 numpy==2.2.6
           python -m pytest -q tools/test_model_manifest.py serve/test_backends.py tools/test_backend_preflight.py serve/test_precision_policy.py serve/test_runtime_precision.py serve/test_resource_admission.py serve/test_request_admission.py serve/test_lane_lifecycle.py
-          python -m pytest -q serve/test_slot_drain.py serve/test_session_protocol.py serve/test_native_lane.py serve/test_native_lane_controls.py serve/test_batch_checkpoint.py serve/test_batch_restore.py serve/test_bound_slot.py serve/test_lane_migration.py serve/test_migration_http.py serve/test_migration_http_integration.py
+          python -m pytest -q serve/test_slot_drain.py serve/test_session_protocol.py serve/test_native_lane.py serve/test_native_lane_controls.py serve/test_batch_checkpoint.py serve/test_batch_restore.py serve/test_bound_slot.py serve/test_lane_migration.py serve/test_migration_http.py serve/test_migration_http_integration.py serve/test_migration_http_shutdown.py
       - name: Check existing serving behavior with local fake engines
         run: python -m pytest -q serve/test_quiet_cancel.py serve/test_request_accounting.py serve/test_replicas.py serve/test_lifecycle.py
       - name: Validate native CPU session persistence

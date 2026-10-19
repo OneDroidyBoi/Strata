@@ -73,6 +73,29 @@ shard sets. Lane/checkpoint/restore/migration/manifest and control/protocol test
 165 passed locally. Record this Python overlay separately from the unchanged C++
 binary; it does not establish GPU continuation or migration success.
 
+### Managed HTTP teardown after a client timeout
+
+Managed listeners now use non-daemon request threads. After stopping acceptance
+with `httpd.shutdown()`, `httpd.server_close()` joins outstanding handlers before
+returning. Only then may the owner close native workers. A client-side timeout
+does not cancel consolidation or prove that its disk transfers and source exits
+finished. Unmanaged listeners retain their existing daemon behavior.
+
+This closes a confirmed lifecycle gap: previously listener closure could return
+while consolidation still ran, allowing owner cleanup to close the destination's
+pipes concurrently with resume/inventory. It is a plausible explanation for the
+reported window20 closed-file failure, not a confirmed diagnosis without the
+exception traceback and timeout/cleanup/native-operation timestamps. Preserve
+that failure independently. Do not classify a source-stop-return event as success
+without checking its result_state and confirmed process exit.
+
+Joining handlers is deliberately not a bounded cancellation mechanism. Keep the
+external safety supervisor authoritative; do not wait past its safety deadline.
+If emergency teardown interrupts migration, report an aborted/blocked operation,
+not graceful completion. Do not call server_close from one of its own handlers.
+The regression holds a handler open and verifies that managed server_close cannot
+return until it completes, without sockets or GPUs. Targeted tests: 73 passed.
+
 ## Isolation and precision gates
 
 1. Inventory GPU UUIDs, processes, reserved devices, free VRAM, host RAM and disk
