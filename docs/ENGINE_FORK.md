@@ -380,8 +380,8 @@ Native binaries must advertise `session_release_batch=1` and
 `session_route_batch=1` in addition to batch export/restore. Older binaries are
 rejected rather than silently ignoring slot ownership. No model process is started
 by the coordinator. Use the same trusted local
-`CheckpointStore` for every worker. The owner must route all traffic through the
-coordinator, without concurrent ordinary HTTP traffic or control-plane changes.
+`CheckpointStore` for every worker. The owner must route all traffic through the coordinator or the HTTP gateway
+below, without concurrent unbound traffic or control-plane changes.
 
 `consolidate(destination)` waits for owned turns and native drain acknowledgements,
 then saves **every lane, including the destination, without unloading**. Each bundle
@@ -427,8 +427,8 @@ owned admissions fail closed; a cancelled partial prefill may therefore block
 migration until explicit recovery, rather than silently checkpoint stale context.
 The caller still constructs the normal next-turn tokenized
 prompt; restoration preserves cached computation, not an unfinished sampled reply.
-The coordinator does not expose an HTTP endpoint or move requests between external
-clients. Passing an agent/slot association is an owner assertion about the running
+The coordinator itself exposes no HTTP endpoint; the optional gateway below
+binds HTTP requests to these owner operations. Passing an agent/slot association is an owner assertion about the running
 session; checkpoint metadata cannot infer which external agent owns it.
 
 A failure gates remaining lanes and leaves immutable bundles plus the last synced
@@ -450,6 +450,79 @@ reuses existing lane allocations; it is not a multi-GPU capacity planner. GPU
 continuation parity and measured three-to-one latency still require an isolated
 runner. No running benchmark lanes were used for these tests.
 
+## HTTP migration gateway
+
+`MigrationGateway` adds one stable HTTP address for an owner-created coordinator.
+Attach it **before starting any managed Service HTTP handler**. It uses already
+loaded, audited native workers and never discovers, loads, or restarts model lanes.
+The same single-GPU, one-batch-group, text-only restrictions apply. Server-side
+vision, image generation and MCP integrations are rejected for these managed lanes.
+Ordinary client tool-call messages remain supported.
+
+```python
+from serve.migration_http import MigrationGateway
+
+# coordinator was constructed with explicit agent-to-slot bindings as above.
+# Read both credentials from your existing secret configuration.
+frontend = worker_a.service
+frontend.api_key = client_api_key
+http = MigrationGateway(coordinator, enabled=True, admin_token=operator_key)
+server = http.serve(frontend, host="127.0.0.1", port=8095)
+```
+
+Clients use the existing `/v1/chat/completions`, `/v1/messages` or `/v1/responses`
+endpoint, with normal authentication and one `X-Strata-Agent-ID` header containing
+a pre-enrolled agent name. Both streaming and non-streaming requests are supported.
+The gateway selects or restores that agent's slot automatically, and holds ownership
+through prompt preparation, the entire response, internal continuations and cleanup.
+It uses the destination Service's existing per-request admission and drain receipts;
+there is no second reservation layer. Each request still supplies its normal message
+history; warm state avoids recomputing cached prefixes. Agent names are routing IDs,
+not separate credentials or a multi-tenant security boundary.
+
+For example, an OpenAI-compatible client can set
+`extra_headers={"X-Strata-Agent-ID": "agent-a"}` on a request; an Anthropic client
+can send the same HTTP header. Reuse the agent ID for that conversation. Missing,
+malformed, duplicate or unknown IDs are rejected before native routing. IDs cannot
+select checkpoint files, raw slots, model identities or new registry entries.
+
+An operator reduces three lanes to one with:
+
+```http
+POST /v1/migration/consolidate
+Authorization: Bearer <client API key>
+X-Strata-Migration-Key: <separate operator key>
+Content-Type: application/json
+
+{"destination":"lane-c","timeout_s":30}
+```
+
+Success returns `{"status":"consolidated"}`. Requests to parked agents thereafter
+restore them on demand; clients do not send checkpoint or restore commands.
+The operator selects the remaining lane explicitly. There is no automatic GPU-demand
+monitor or policy that chooses when to shrink. Repeating a successful request for
+the same destination is safe; changing the destination after consolidation is
+rejected without disturbing the remaining lane. Omitting `admin_token` disables
+HTTP consolidation while retaining agent routing.
+
+A busy route or drain returns HTTP 503 with a retry hint when retry is safe. Invalid
+client input is rejected without gating unrelated lanes; a failed native migration
+keeps its existing fail-closed behavior and requires owner recovery. Client disconnects
+close the response iterator and retain reservations until native work drains. Waiting
+for migration may complete a safe checkpoint/restore before cancellation is observed;
+it does not interrupt a disk or GPU state transfer halfway through it.
+
+Ordinary load/unload, VRAM, slot-file, settings/configuration and image-generation
+HTTP controls are disabled on managed listeners. Idle unload and automatic model
+restart are also blocked for managed services. Non-migration services retain their
+existing behavior. A non-loopback gateway bind requires a frontend API key; the
+operator key is separately checked and never returned by the HTTP API. Journal
+paths and internal native errors are not exposed by migration administration.
+
+HTTP tests run against local fake lanes and real request handlers. GPU context
+continuation and end-to-end performance remain unqualified; no running lanes were
+accessed or reconfigured for this integration.
+
 ## Validation
 
 From the repository root, run the CPU-only suites relevant to these components:
@@ -457,7 +530,7 @@ From the repository root, run the CPU-only suites relevant to these components:
 ```sh
 python -m pip install jinja2==3.1.6 pytest==8.4.2
 python -m pytest -q tools/test_model_manifest.py serve/test_backends.py tools/test_backend_preflight.py serve/test_precision_policy.py serve/test_runtime_precision.py serve/test_resource_admission.py serve/test_request_admission.py serve/test_lane_lifecycle.py
-python -m pytest -q serve/test_slot_drain.py serve/test_session_protocol.py serve/test_native_lane.py serve/test_native_lane_controls.py serve/test_batch_checkpoint.py serve/test_batch_restore.py serve/test_bound_slot.py serve/test_lane_migration.py
+python -m pytest -q serve/test_slot_drain.py serve/test_session_protocol.py serve/test_native_lane.py serve/test_native_lane_controls.py serve/test_batch_checkpoint.py serve/test_batch_restore.py serve/test_bound_slot.py serve/test_lane_migration.py serve/test_migration_http.py serve/test_migration_http_integration.py
 python -m pytest -q serve/test_quiet_cancel.py serve/test_request_accounting.py serve/test_replicas.py serve/test_lifecycle.py
 ```
 

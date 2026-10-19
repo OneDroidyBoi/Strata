@@ -3669,6 +3669,8 @@ class Service:
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
+        if getattr(self, 'migration_gateway', None) is not None:
+            raise EngineDied('migration lane is unavailable; explicit owner recovery is required')
         if getattr(self, 'native_lane_gated', False):
             raise GpuBusy('native lane lifecycle is gated; explicit owner recovery is required', retry_after=15)
         hook_failed = None
@@ -3797,6 +3799,9 @@ class Service:
 
     def load(self):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
+        gateway = getattr(self, 'migration_gateway', None)
+        if gateway is not None:
+            gateway.require_bound(self)
         if getattr(self, 'native_lane_gated', False):
             raise GpuBusy('native lane lifecycle is gated; explicit owner recovery is required', retry_after=15)
         # a request is on its way: the idle thread must not unload between this and the request's own start
@@ -3845,6 +3850,9 @@ class Service:
     def unload(self, idle_for: float | None = None) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
         with idle_for: one ran more recently than that) or "unsupported"."""
+        if getattr(self, 'migration_gateway', None) is not None:
+            return "busy"
+
         if not hasattr(self.engine, "unload"):
             return "unsupported"
         if not self.fifo.acquire(blocking=False):
@@ -4445,6 +4453,13 @@ class Service:
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
+        gateway = getattr(self, 'migration_gateway', None)
+        if gateway is not None:
+            from serve.migration_http import MigrationHTTPError
+            try:
+                gateway.require_bound(self)
+            except MigrationHTTPError as exc:
+                raise EngineDied(str(exc)) from exc
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
@@ -5408,6 +5423,11 @@ class BadBody(Exception):
 
 
 def make_handler(svc: Service):
+    from serve.migration_http import MigrationHTTPError
+    gateway = getattr(svc, 'migration_gateway', None)
+    svc._migration_http_started = True
+    if gateway is not None:
+        svc = gateway.proxy(svc)
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
@@ -5418,6 +5438,10 @@ def make_handler(svc: Service):
 
         def log_message(self, fmt, *args):
             pass
+
+        def _engine_error(self, error):
+            suffix = "explicit owner recovery may be required" if gateway is not None else "the next request restarts it"
+            return f"{error}; {suffix}"
 
         def handle_one_request(self):
             self.answer_started = False
@@ -5581,6 +5605,12 @@ def make_handler(svc: Service):
             usually still succeeds), so a dropped request kept the engine busy until its answer or the whole prompt
             was done.  Every 0.5 s: the socket readable with nothing to read (EOF) means the client closed it.  A
             request is HTTP/1.0 and fully read here, so no later bytes are expected - data is not a hang-up."""
+            if gateway is not None:
+                if self.watch_done is not None:
+                    self.watch_done.set()
+                early = getattr(self, '_migration_cancel', None)
+                if early is not None and early.is_set():
+                    cancel.set()
             done = self.watch_done = threading.Event()
             sock = self.connection
 
@@ -5603,7 +5633,10 @@ def make_handler(svc: Service):
         def _note(self, **values):
             """#332: what the monitor shows about this request (nothing when the monitor is off)."""
             if self.record is not None:
-                with svc.status_lock:
+                # Disconnect watchers run on a different thread: do not resolve
+                # their Service through the request-thread-local proxy.
+                target = getattr(self, '_migration_service', svc)
+                with target.status_lock:
                     self.record.update(values)
 
         def _cors(self):
@@ -5831,7 +5864,14 @@ def make_handler(svc: Service):
 
         def do_POST(self):
             try:
-                self._post()
+                if gateway is None:
+                    self._post()
+                else:
+                    # Keep the route and selected Service through response iteration,
+                    # disconnect cleanup, tool continuations and request accounting.
+                    with contextlib.ExitStack() as scope:
+                        self._migration_scope = scope
+                        self._post()
             except BadBody as e:                              # #893: a malformed or oversized chunked body
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
@@ -5840,6 +5880,12 @@ def make_handler(svc: Service):
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
+                return
+            if gateway is not None and (path in {
+                    "/settings", "/config", "/load", "/unload", "/v1/load", "/v1/unload",
+                    "/v1/vram", "/v1/images/generations"} or path.startswith("/slots/")):
+                self._json(409, {"error": {"type": "migration_owned", "message":
+                    "lane controls are owned by the migration gateway"}})
                 return
             if path == "/settings":
                 self._settings()
@@ -5878,6 +5924,23 @@ def make_handler(svc: Service):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                if gateway is not None and path == "/v1/migration/consolidate":
+                    if set(req) - {"destination", "timeout_s"}:
+                        raise MigrationHTTPError(400, "expected destination and optional timeout_s")
+                    keys = self.headers.get_all("X-Strata-Migration-Key", [])
+                    if len(keys) != 1:
+                        raise MigrationHTTPError(403, "missing or invalid migration operator key")
+                    result = gateway.consolidate(req.get("destination"), keys[0], req.get("timeout_s", 30.0))
+                    self._json(200, {"status": result.state})
+                    return
+                if gateway is not None and path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    agent = gateway.agent_from_headers(self.headers)
+                    if req.get("strata_mcp") or req.get("strata_checkpoint") is False:
+                        raise MigrationHTTPError(400, "migration requests require cached text generation without server MCP")
+                    self._migration_cancel = threading.Event()
+                    self._watch_client(self._migration_cancel)
+                    self._migration_service = self._migration_scope.enter_context(
+                        gateway.request(agent, cancel=self._migration_cancel))
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -5942,6 +6005,9 @@ def make_handler(svc: Service):
                     self._images(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except MigrationHTTPError as e:
+                self._json(e.status, {"error": {"type": "migration_error", "message": str(e)}},
+                           headers={"Retry-After": e.retry_after} if e.retry_after is not None else None)
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
                 print(f"[strata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
@@ -5973,7 +6039,7 @@ def make_handler(svc: Service):
                                   "message": f"the request is malformed ({type(e).__name__}: {e})"}}
                 self._json(400, responses_error_body(body["error"]["message"]) if path == "/v1/responses" else body)
             except EngineDied as e:                          # before the answer started (not streamed)
-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+                self._json(503, {"error": {"type": "server_error", "message": self._engine_error(e)}})
             except EngineStuck as e:                         # an unload or restart that could not end the engine
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
 
@@ -6275,7 +6341,7 @@ def make_handler(svc: Service):
                 cancel.set()                                 # client went away: stop the engine
                 chunks.close()
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
-                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                err = {"error": {"type": "server_error", "message": self._engine_error(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
@@ -6347,7 +6413,7 @@ def make_handler(svc: Service):
                     return self._json(502, responses_error_body(str(e), "server_error",
                                                                 code="structured_output_failed"))
                 except EngineDied as e:
-                    return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
+                    return self._json(503, responses_error_body(self._engine_error(e), "server_error",
                                                                 code="server_error"))
                 except EngineNonFinite as e:                 # #879, twice: not the request's fault
                     return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
@@ -6380,7 +6446,7 @@ def make_handler(svc: Service):
                 cancel.set()                                 # client went away: stop the engine
                 items.close()
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
-                self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
+                self._responses_failed(asm, self._engine_error(e), "server_error", send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
@@ -6499,7 +6565,7 @@ def make_handler(svc: Service):
                 cancel.set()
                 events.close()
             except EngineDied as e:                          # mid-stream: Anthropic's error event
-                err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                err = {"type": "error", "error": {"type": "api_error", "message": self._engine_error(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
@@ -6775,6 +6841,9 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
 
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
+    gateway = getattr(svc, 'migration_gateway', None)
+    if gateway is not None:
+        gateway.validate_bind(svc, host)
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
