@@ -357,8 +357,8 @@ if result.state != "resumed":
 ```
 
 The owner chooses the source session and destination slot. This is a Python owner
-API, not an automatic signal handler, HTTP session router or 3-to-1 lane migration
-controller. Agent-to-checkpoint ownership routing remains separate work. Restore
+API. The migration coordinator below adds explicit agent ownership and three-to-one
+consolidation; HTTP session routing and automatic signal handlers remain separate. Restore
 requires the same model, context/KV layout and other state-compatible configuration.
 Existing cached slots are not overwritten; unused slots must already exist in the
 configured batch, with their residency included in calibrated fixed memory costs.
@@ -371,6 +371,85 @@ save active-generation sampling/counters, the last emitted but not yet consumed
 token, cache pinning policy or a partial prompt's execution plan; they do not resume
 a sampled reply midway through it.
 
+## Cross-lane migration (opt-in owner API)
+
+`MigrationCoordinator` binds named agents to explicit slots on already-running,
+identity-validated `NativeLaneWorker` instances. All lanes must load the same
+state-compatible model/configuration and retain Q4-minimum/Q8-preferred audits.
+Native binaries must advertise `session_release_batch=1` and
+`session_route_batch=1` in addition to batch export/restore. Older binaries are
+rejected rather than silently ignoring slot ownership. No model process is started
+by the coordinator. Use the same trusted local
+`CheckpointStore` for every worker. The owner must route all traffic through the
+coordinator, without concurrent ordinary HTTP traffic or control-plane changes.
+
+`consolidate(destination)` waits for owned turns and native drain acknowledgements,
+then saves **every lane, including the destination, without unloading**. Each bundle
+and the agent-to-checkpoint journal are synced to disk before source shutdown.
+Only verified source-process exit retires that lane's fixed memory charges.
+The destination retains its resident agents and fills empty slots from sources.
+Overflow agents stay parked on disk, with exact model, bundle and session bindings.
+Unmanaged live/parked/native slot state is included in the snapshots too; it is
+never silently treated as an empty destination slot.
+
+`activate(agent)` brings a parked agent back on demand. With a full destination,
+it first saves the latest state of all resident agents and syncs the updated
+journal. It then releases the least-recently-used managed slot, restores the
+requested checkpoint into that slot, and explicitly resumes admission. Corrupt
+incoming checkpoints are rejected before eviction. This is turn-boundary rotation:
+other active turns drain before a context switch, and the existing slot allocation
+is reused. Slot release does not return GPU memory; stopping a source lane does.
+
+```python
+from serve.lane_migration import MigrationCoordinator
+
+coordinator = MigrationCoordinator(
+    {"lane-a": worker_a, "lane-b": worker_b, "lane-c": worker_c},
+    store,
+    {"agent-a": ("lane-a", 0), "agent-b": ("lane-b", 0),
+     "agent-c": ("lane-c", 0)},
+    enabled=True,
+)
+result = coordinator.consolidate("lane-c")
+if result.state != "consolidated":
+    raise RuntimeError(result.error)
+# Each iterator must be consumed or closed by its owner.
+for token in coordinator.generate("agent-a", prompt_ids, max_new, sampling, cancel):
+    consume(token)
+```
+
+`generate` combines exact slot binding, per-request resource admission and native
+drain receipts. Multiple different resident agents can run concurrently. A bound
+request waits for its own slot; it cannot spill into another agent's slot or use
+the unbound solo path. Owned admission also publishes completed short replies
+into their assigned slot before acknowledging completion. Ambiguous/partial
+owned admissions fail closed; a cancelled partial prefill may therefore block
+migration until explicit recovery, rather than silently checkpoint stale context.
+The caller still constructs the normal next-turn tokenized
+prompt; restoration preserves cached computation, not an unfinished sampled reply.
+The coordinator does not expose an HTTP endpoint or move requests between external
+clients. Passing an agent/slot association is an owner assertion about the running
+session; checkpoint metadata cannot infer which external agent owns it.
+
+A failure gates remaining lanes and leaves immutable bundles plus the last synced
+`migration-*.json` journal available for owner recovery. Process replacement is
+rejected instead of silently accepting empty context. No automatic rollback,
+restart or crash-recovery replay is attempted. The journal references the latest
+successful snapshot, **not tokens generated since it**. Source lanes remain
+stopped after successful consolidation; scaling back out is separate work.
+
+If an owned turn has not finished within the routing wait, `activate` or
+`consolidate` returns `waiting` without closing admission; it can be retried.
+The token iterator raises retryable `MigrationBusy` in that case. Failures after
+native state work begins remain gated. The operation timeout bounds each drain
+wait, not the total disk-transfer time.
+Storage must accommodate all snapshots, including later rotations; automatic
+checkpoint garbage collection and disk quotas are not implemented. Calibrated host
+budgets must include retained state and checkpoint read scratch. This coordinator
+reuses existing lane allocations; it is not a multi-GPU capacity planner. GPU
+continuation parity and measured three-to-one latency still require an isolated
+runner. No running benchmark lanes were used for these tests.
+
 ## Validation
 
 From the repository root, run the CPU-only suites relevant to these components:
@@ -378,7 +457,7 @@ From the repository root, run the CPU-only suites relevant to these components:
 ```sh
 python -m pip install jinja2==3.1.6 pytest==8.4.2
 python -m pytest -q tools/test_model_manifest.py serve/test_backends.py tools/test_backend_preflight.py serve/test_precision_policy.py serve/test_runtime_precision.py serve/test_resource_admission.py serve/test_request_admission.py serve/test_lane_lifecycle.py
-python -m pytest -q serve/test_slot_drain.py serve/test_session_protocol.py serve/test_native_lane.py serve/test_native_lane_controls.py serve/test_batch_checkpoint.py serve/test_batch_restore.py
+python -m pytest -q serve/test_slot_drain.py serve/test_session_protocol.py serve/test_native_lane.py serve/test_native_lane_controls.py serve/test_batch_checkpoint.py serve/test_batch_restore.py serve/test_bound_slot.py serve/test_lane_migration.py
 python -m pytest -q serve/test_quiet_cancel.py serve/test_request_accounting.py serve/test_replicas.py serve/test_lifecycle.py
 ```
 
@@ -404,7 +483,8 @@ continuation equivalence before enabling this on a serving lane.
    reservations before extending beyond the single-lane text-only scope.
 3. Harden shared expert-store publication/attach semantics with immutable identity.
 4. Build every affected GPU backend and qualify batch export and destination-slot
-   restoration; then add agent-to-checkpoint ownership routing.
+   restoration and owned-slot turn completion; then qualify three-to-one migration
+   and on-demand rotation with real agent traffic.
 5. Qualify another architecture and, with the benchmark runner, useful deep-context
    concurrency and lane-count transitions. A generic metadata type is not support
    for another model's executor or state format.

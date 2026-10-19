@@ -35,7 +35,7 @@ class LaneWorker(Protocol):
 
 @dataclass(frozen=True)
 class LifecycleResult:
-    state: str  # stopped, restored, resumed, blocked; blocked never promises worker liveness
+    state: str  # stopped, parked, released, restored, resumed, blocked; blocked never promises worker liveness
     checkpoint_id: str | None = None
     error: str | None = None
 

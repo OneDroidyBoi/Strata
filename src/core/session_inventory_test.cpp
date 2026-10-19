@@ -96,6 +96,42 @@ int main() {
     quarantined[1].tainted = true; // partial GPU transfer cannot silently disappear from inventory.
     assert(!session_inventory_append_slots(quarantined, entries, error) && entries.empty());
     assert(slots[0].cached && slots[0].tokens == 8 && !slots[1].tainted);
+    assert(session_slot_release_parse("RELEASE_SLOT 0", 2, target, error) && target == 0);
+    for (const auto& command : {"RELEASE_SLOT", "RELEASE_SLOT ", "RELEASE_SLOT -1", "RELEASE_SLOT +1",
+            "RELEASE_SLOT 01", "RELEASE_SLOT 2", "RELEASE_SLOT 0 junk", "RELEASE_SLOT 0 ",
+            "RELEASE_SLOT 99999999999999999999999"})
+        assert(!session_slot_release_parse(command, 2, target, error));
+    assert(session_slot_release_ready(slots, 0, true, error));
+    assert(!session_slot_release_ready(slots, 1, true, error)); // empty is never silently released
+    assert(!session_slot_release_ready(slots, 0, false, error));
+    for (int mode = 0; mode < 7; ++mode) {
+        auto blocked = slots;
+        if (mode == 0) blocked[1].active = true;
+        if (mode == 1) blocked[1].partial = true;
+        if (mode == 2) blocked[0].tainted = true;
+        if (mode == 3) blocked[0].images = true;
+        if (mode == 4) blocked[0].cached = false;
+        if (mode == 5) blocked[0].layout_valid = false;
+        if (mode == 6) blocked[0].tokens = 0;
+        assert(!session_slot_release_ready(blocked, 0, true, error));
+    }
+    struct Metadata { std::vector<int> ids; bool cached = false; std::chrono::steady_clock::time_point start{}; };
+    std::vector<Metadata> metadata{{{1,2,3},true,{}},{{7,8},true,{}}};
+    assert(!session_slot_release(metadata, slots, 0, false, error));
+    assert(metadata[0].ids.size() == 3 && metadata[1].ids.size() == 2);
+    assert(session_slot_release(metadata, slots, 0, true, error));
+    assert(metadata[0].ids.empty() && !metadata[0].cached);
+    assert(metadata[1].ids == std::vector<int>({7,8}) && metadata[1].cached);
+    const std::vector<int32_t> current{1,2,3};
+    const std::vector<int64_t> requested{1,2,3};
+    assert(session_owned_prefix_valid(false, false, true, 1, current, requested)); // max_new=1 / first EOS
+    assert(!session_owned_prefix_valid(true, false, true, 1, current, requested)); // cancel even at exact boundary
+    assert(!session_owned_prefix_valid(false, true, true, 1, current, requested));
+    assert(!session_owned_prefix_valid(false, false, false, 1, current, requested));
+    assert(!session_owned_prefix_valid(false, false, true, 0, current, requested));
+    assert(!session_owned_prefix_valid(false, false, true, 1, std::vector<int32_t>{1,2}, requested));
+    assert(!session_owned_prefix_valid(false, false, true, 1, std::vector<int32_t>{1,2,4}, requested));
+    assert(!session_owned_prefix_valid(false, false, true, 1, std::vector<int32_t>{}, std::vector<int64_t>{}));
     std::filesystem::remove(path);
     std::cout << "session inventory tests passed\n";
 }

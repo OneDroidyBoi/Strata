@@ -179,3 +179,19 @@ class SessionProtocol:
         except Exception:
             self.engine._session_protocol_failed = True
             raise
+
+    def release_slot(self, slot):
+        from serve.server import SessionRefused
+        if (getattr(self.engine, 'session_batch_release', False) is not True
+                or type(slot) is not int or not 0 <= slot < getattr(self.engine, 'batch', 0)):
+            raise ValueError('unadvertised or invalid native release slot')
+        try:
+            self._start(f'RELEASE_SLOT {slot}')
+            if self._read(time.monotonic() + self.timeout) != ['SLOT_RELEASED', str(slot)]:
+                raise SessionProtocolError('invalid native slot release acknowledgement')
+            return {'slot': slot}
+        except SessionRefused:
+            raise
+        except Exception:
+            self.engine._session_protocol_failed = True
+            raise

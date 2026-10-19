@@ -10498,7 +10498,7 @@ int main(int argc, char** argv) {
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "",
-                        session_export_batch ? " session_export=1 session_export_batch=1 session_restore_batch=1" :
+                        session_export_batch ? " session_export=1 session_export_batch=1 session_restore_batch=1 session_release_batch=1 session_route_batch=1" :
                         session_export_enabled ? " session_export=1" : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
@@ -11384,6 +11384,32 @@ int main(int argc, char** argv) {
                         if (key == "slot-" + std::to_string(b)) export_slot = (int) b;
                 line = "SAVE " + line.substr(second + 1);
             }
+            if (line.rfind("RELEASE_SLOT", 0) == 0) {
+                try {
+                    std::string why;
+                    size_t target = 0;
+                    if (!strata::core::session_slot_release_parse(line, bs.size(), target, why)) {
+                        std::printf("SERR invalid 0 %s\n", why.c_str()); std::fflush(stdout); continue;
+                    }
+                    std::vector<strata::core::SessionInventorySlot> slots;
+                    for (size_t b = 0; b < bs.size(); ++b) {
+                        const auto& sl = bs[b];
+                        bool valid = bslot_ss.size() == 1 && b < bslot_ss[0].size() && bslot_ss[0][b] != nullptr;
+                        for (const auto& cp : sl.checks) valid = valid && cp.stage_parts.empty() && cp.imgs.empty();
+                        slots.push_back({b, sl.ids.size(), sl.checks.size(), sl.active, sl.cached,
+                                         sl.partial, sl.tainted, sl.img, valid});
+                    }
+                    // The owner publishes a durable export before releasing. This command drops only host
+                    // metadata/checkpoints; bslot_ss buffers, live state and other cached slots are untouched.
+                    if (!strata::core::session_slot_release(bs, slots, target, session_export_batch && !nan_flush, why)) {
+                        std::printf("SERR invalid 0 %s\n", why.c_str()); std::fflush(stdout); continue;
+                    }
+                    std::printf("SLOT_RELEASED %zu\n", target); std::fflush(stdout);
+                } catch (const std::bad_alloc&) {
+                    std::printf("SERR memory 0 not enough RAM to inspect release target\n"); std::fflush(stdout);
+                }
+                continue;
+            }
             if (line.rfind("RESTORE_SLOT", 0) == 0) {
                 try {
                     std::string restore_path, why;
@@ -11829,6 +11855,7 @@ int main(int argc, char** argv) {
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
             // when that reaches --prompt-cache-root.  Absent = checkpointed as before.
             int req_ckpt = 1;
+            bool req_lane_owned = false, req_lane_owned_seen = false, req_lane_owned_bad = false;
             // pin=N: the first N prompt tokens are a shared read-only prefix (a long document that many short queries
             // follow).  The prompt is read in two parts at N, the checkpoint there is PINNED (retention never evicts it,
             // a parked conversation holding it stays parked) and a later request that resumes from it does not park the
@@ -11858,6 +11885,12 @@ int main(int argc, char** argv) {
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "lane_owned") {
+                        const std::string value = tok.substr(eq + 1);
+                        req_lane_owned_bad = req_lane_owned_bad || req_lane_owned_seen || (value != "0" && value != "1");
+                        req_lane_owned_seen = true;
+                        req_lane_owned = value == "1";
+                    }
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
                     else if (key == "temperature") req_temperature = fv;
@@ -11891,6 +11924,10 @@ int main(int argc, char** argv) {
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
             std::vector<float> req_bias;
             std::string bias_error;
+            if (req_lane_owned_bad || (req_lane_owned && (!session_export_batch || admit_slot < 0 || geni || !req_ckpt || o.prompt_cache <= 0))) {
+                std::printf("ERR lane_owned requires supported text BGEN, ckpt=1 and a unique lane_owned=1 key\n");
+                std::fflush(stdout); continue;
+            }
             if (req_bias_present && (o.batch > 0 ||
                 !strata::core::parse_logit_bias(req_bias_text, (int) n_vocab, req_bias, bias_error))) {
                 std::printf("ERR logit_bias: %s\n", o.batch > 0 ? "continuous batching is not supported" : bias_error.c_str());
@@ -13009,7 +13046,7 @@ int main(int argc, char** argv) {
                 // where the rest is read the same way after it (more than a chunk and more than a short read left),
                 // text only, and into a slot that is not decoding.
                 auto give_way = [&](int ys, int64_t q, std::string& err) -> bool {
-                    const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active &&
+                    const bool can = !req_lane_owned && ys < (int) bs.size() && !bs[(size_t) ys].active &&
                                      (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
                                      b0 - q > std::max<int64_t>(C_read, o.short_read);
                     std::string ye;
@@ -14819,6 +14856,52 @@ int main(int argc, char** argv) {
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
+                if (req_lane_owned) {
+                    auto owned_failure = [&](const char* why) {
+                        auto& target = bs[(size_t) admit_slot];
+                        target.active = false; target.cached = false; target.tainted = true;
+                        std::printf("ERR lane_owned publication failed: ");
+                        for (const char* ch = why; *ch; ++ch) std::putchar(*ch == '\n' || *ch == '\r' ? ' ' : *ch);
+                        std::putchar('\n'); std::fflush(stdout);
+                        admit_slot = -1; adm_drain_ms = 0;
+                    };
+                    if (!strata::core::session_owned_prefix_valid(cancelled || std::strcmp(finish, "cancel") == 0,
+                            nf_hit, live_ok, produced_n, live, ids) || !live_imgs.empty() || yielded_at >= 0) {
+                        owned_failure("no exact completed request prefix"); continue;
+                    }
+                    try {
+                        // Prepare all usable checkpoints before any target writes. A terminal first token (EOS or
+                        // max_new=1) needs the same fresh slot publication as an admission that continues decoding.
+                        uint64_t need = uint64_t(live.size()) * sizeof(int32_t) + sizeof(BSlot);
+                        auto usable = [&](const ConvCheckpoint& cp) {
+                            return !cp.ids.empty() && cp.ids.size() <= live.size() && cp.stage_parts.empty() &&
+                                cp.imgs.empty() && std::equal(cp.ids.begin(), cp.ids.end(), live.begin());
+                        };
+                        for (const auto& cp : checks) if (usable(cp)) {
+                            const uint64_t overhead = 2 * sizeof(ConvCheckpoint);
+                            if (overhead > UINT64_MAX - need || cp.bytes() > UINT64_MAX - need - overhead) {
+                                need = UINT64_MAX; break;
+                            }
+                            need += cp.bytes() + overhead;
+                        }
+                        if (!strata::core::conversation_memory_admit(strata::core::available_host_bytes(), need,
+                                uint64_t(o.conversation_cache_min_free_mib) << 20)) {
+                            owned_failure("not enough RAM for slot metadata"); continue;
+                        }
+                        BSlot next;
+                        next.ids = live;
+                        for (const auto& cp : checks) if (usable(cp)) next.checks.push_back(cp);
+                        next.active = cont; next.cached = !cont;
+                        next.x = x; next.p = (int64_t) live.size(); next.produced = 1;
+                        next.max_new = admit_max_new; next.t0 = Clock::now(); next.cvec = cvec_cached;
+                        if (!copy_to_slot(admit_slot, live, err)) { owned_failure(err.c_str()); continue; }
+                        if (cont) ver.set_slot_sampling(admit_slot, req_sp);
+                        bs[(size_t) admit_slot] = std::move(next);
+                        std::printf("BOWN %d %zu\n", admit_slot, live.size());
+                    } catch (const std::bad_alloc&) {
+                        owned_failure("not enough RAM to publish slot"); continue;
+                    }
+                } else {
                 const auto tc0 = Clock::now();
                 if (cont && !copy_to_slot(admit_slot, live, err)) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
@@ -14906,6 +14989,7 @@ int main(int argc, char** argv) {
                                      span(tc1, tc2), span(tc3, tc4), move_best ? " (moved)" : "");
                     }
                 }
+                } // legacy admission path (lane_owned absent)
                 std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
                 if (trace && piped && cont) {
                     rows_wait = "the admission";

@@ -90,6 +90,7 @@ class BatchEngine(Engine):
     batch = 2
     session_batch_export = True
     session_batch_restore = True
+    session_batch_release = True
     slot_groups = 1
 
     def __init__(self, model, fifo):
@@ -121,6 +122,12 @@ class BatchEngine(Engine):
         self.generation = f'process1-restored{len(self.restores)}'
         self.entries.append({'id': f'slot-{slot}', 'kind': 'slot', 'tokens': len(ids)})
         return {'tokens': len(ids), 'bytes': Path(path).stat().st_size, 'ms': 1.0, 'ids': ids}
+
+    def session_release_slot(self, slot):
+        assert self.fifo.locked() and self.ctl.locked()
+        self.entries = [e for e in self.entries if e['id'] != f'slot-{slot}']
+        self.generation += '-release'
+        return {'slot': slot}
 
     def close(self):
         assert self.ctl.locked()
@@ -519,6 +526,145 @@ class NativeSlotRestoreTests(unittest.TestCase):
         self.assertEqual(result.state, 'blocked')
         self.assertIn('routing state changed', result.error)
         self.assertTrue(self.ready.native_lane_gated)
+
+
+class NativeParkedLaneTests(unittest.TestCase):
+    setUp = NativeLaneTests.setUp
+    batch_lane = NativeBatchLaneTests.batch_lane
+
+    def test_snapshot_stays_loaded_and_resume_needs_no_restore(self):
+        service, worker = self.batch_lane()
+        parked = worker.quiesce_snapshot(self.store)
+        self.assertEqual(parked.state, 'parked', parked.error)
+        self.assertEqual(len(self.store.sessions(parked.checkpoint_id, self.model)), 4)
+        self.assertEqual(service.engine.close_count, 0)
+        self.assertTrue(service.engine.alive())
+        self.assertTrue(service.native_lane_gated)
+        self.assertEqual(worker.resume().state, 'resumed')
+        lease = service.request_admission.acquire(1, 1)
+        service.request_admission.ledger.release(lease, iterator_closed=True, work_drained=True)
+        self.assertEqual(service.request_admission.ledger.snapshot()['host_bytes'], 10)
+
+    def test_empty_unbatched_snapshot_can_resume(self):
+        self.engine.entries = []
+        parked = self.worker.quiesce_snapshot(self.store)
+        self.assertEqual(parked.state, 'parked', parked.error)
+        self.assertEqual(self.worker.resume().state, 'resumed')
+        self.assertTrue(self.engine.alive())
+        self.assertFalse(self.service.native_lane_gated)
+
+    def test_stop_parked_commits_only_matching_durable_snapshot(self):
+        service, worker = self.batch_lane()
+        parked = worker.quiesce_snapshot(self.store)
+        result = worker.stop_parked(self.store, parked.checkpoint_id)
+        self.assertEqual(result.state, 'stopped', result.error)
+        self.assertEqual(service.engine.close_count, 1)
+        self.assertEqual(service.request_admission.ledger.snapshot()['host_bytes'], 0)
+        self.assertEqual(worker.stop_parked(self.store, parked.checkpoint_id).state, 'stopped')
+        self.assertEqual(service.engine.close_count, 1)
+        self.assertFalse(service.fifo.locked())
+        self.assertFalse(service.engine.ctl.locked())
+
+    def test_repeated_parked_stop_does_not_hide_unexpected_restart(self):
+        service, worker = self.batch_lane()
+        parked = worker.quiesce_snapshot(self.store)
+        self.assertEqual(worker.stop_parked(self.store, parked.checkpoint_id).state, 'stopped')
+        service.engine.proc = Process()
+        service.engine.gen += 1
+        result = worker.stop_parked(self.store, parked.checkpoint_id)
+        self.assertEqual(result.state, 'blocked')
+        self.assertIn('restarted after parked stop', result.error)
+        self.assertEqual(service.engine.close_count, 1)
+
+    def test_corrupt_parked_bundle_prevents_stop(self):
+        service, worker = self.batch_lane()
+        parked = worker.quiesce_snapshot(self.store)
+        (self.store.root / parked.checkpoint_id / 'session-0000.bin').write_bytes(b'corrupted')
+        result = worker.stop_parked(self.store, parked.checkpoint_id)
+        self.assertEqual(result.state, 'blocked')
+        self.assertIn('checksum', result.error)
+        self.assertEqual(service.engine.close_count, 0)
+        self.assertTrue(service.engine.alive())
+        self.assertEqual(service.request_admission.ledger.snapshot()['host_bytes'], 10)
+
+    def test_changed_native_inventory_prevents_parked_stop(self):
+        service, worker = self.batch_lane()
+        parked = worker.quiesce_snapshot(self.store)
+        service.engine.generation += '-changed'
+        result = worker.stop_parked(self.store, parked.checkpoint_id)
+        self.assertEqual(result.state, 'blocked')
+        self.assertEqual(service.engine.close_count, 0)
+        self.assertEqual(worker.resume().state, 'blocked')
+
+    def test_consecutive_durable_releases_preserve_neighbors_then_resume(self):
+        service, worker = self.batch_lane()
+        parked = worker.quiesce_snapshot(self.store)
+        other = [e for e in deepcopy(service.engine.entries) if e['kind'] != 'slot']
+        self.assertEqual(worker.release_slot(0).state, 'released')
+        self.assertEqual(worker.release_slot(1).state, 'released')
+        self.assertEqual(service.engine.entries, other)
+        self.assertEqual(service.engine.slot_held, [[], []])
+        self.assertEqual(len(self.store.sessions(parked.checkpoint_id, self.model)), 4)
+        self.assertEqual(worker.resume().state, 'resumed')
+        self.assertEqual(service.engine.close_count, 0)
+        self.assertEqual(service.request_admission.ledger.snapshot()['host_bytes'], 10)
+
+    def test_release_without_full_snapshot_is_blocked_before_native_mutation(self):
+        service, worker = self.batch_lane()
+        before = deepcopy(service.engine.entries)
+        result = worker.release_slot(0)
+        self.assertEqual(result.state, 'blocked')
+        self.assertEqual(service.engine.entries, before)
+        self.assertTrue(service.native_lane_gated)
+        self.assertEqual(worker.resume().state, 'blocked')
+
+    def test_release_then_restore_requires_new_snapshot_before_next_eviction(self):
+        service, worker = self.batch_lane()
+        worker.quiesce_snapshot(self.store)
+        self.assertEqual(worker.release_slot(0).state, 'released')
+        restored_bundle = self.store.publish(self.model, [SessionMetadata('new', self.model)],
+                                             lambda _, p: p.write_text('8,9,10'))
+        result = worker.restore_slot(self.store, restored_bundle, 'new', 0)
+        self.assertEqual(result.state, 'restored', result.error)
+        before = deepcopy(service.engine.entries)
+        blocked = worker.release_slot(0)
+        self.assertEqual(blocked.state, 'blocked')
+        self.assertEqual(service.engine.entries, before)
+
+    def test_new_snapshot_after_restore_allows_safe_rotation(self):
+        service, worker = self.batch_lane()
+        worker.quiesce_snapshot(self.store)
+        self.assertEqual(worker.release_slot(0).state, 'released')
+        restored_bundle = self.store.publish(self.model, [SessionMetadata('new', self.model)],
+                                             lambda _, p: p.write_text('8,9,10'))
+        self.assertEqual(worker.restore_slot(self.store, restored_bundle, 'new', 0).state, 'restored')
+        # Fake export must serialize the restored IDs just as native export would.
+        original = service.engine.session_export
+        def export(generation, sid, path):
+            original(generation, sid, path)
+            if sid == 'slot-0':
+                Path(path).write_text('8,9,10')
+        service.engine.session_export = export
+        parked = worker.quiesce_snapshot(self.store)
+        self.assertEqual(parked.state, 'parked', parked.error)
+        self.assertEqual(worker.release_slot(0).state, 'released')
+        self.assertEqual(worker.resume().state, 'resumed')
+
+    def test_release_acknowledgement_cannot_hide_neighbor_mutation(self):
+        service, worker = self.batch_lane()
+        worker.quiesce_snapshot(self.store)
+        original = service.engine.session_release_slot
+        def corrupt(slot):
+            reply = original(slot)
+            service.engine.entries[0]['tokens'] += 1
+            return reply
+        service.engine.session_release_slot = corrupt
+        result = worker.release_slot(0)
+        self.assertEqual(result.state, 'blocked')
+        self.assertIn('changed other state', result.error)
+        self.assertEqual(service.engine.slot_held[0], [1, 2])
+        self.assertEqual(worker.resume().state, 'blocked')
+        self.assertEqual(service.engine.close_count, 0)
 
 
 if __name__ == '__main__':

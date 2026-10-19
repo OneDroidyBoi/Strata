@@ -173,3 +173,47 @@ def test_restore_clean_refusal_leaves_protocol_aligned():
     with pytest.raises(SessionRefused):
         SessionProtocol(e).restore_slot(0, '/tmp/a')
     assert SessionProtocol(e).inventory()['sessions'] == []
+
+
+def test_release_slot_requires_matching_acknowledgement():
+    e = restore_engine('SLOT_RELEASED 1')
+    e.session_batch_release = True
+    assert SessionProtocol(e).release_slot(1) == {'slot': 1}
+    e._send.assert_called_once_with('RELEASE_SLOT 1')
+
+
+@pytest.mark.parametrize('reply', ['SLOT_RELEASED 0', 'SLOT_RELEASED 1 extra', 'ERR active', None])
+def test_release_failure_blocks_protocol_without_killing_neighbors(reply):
+    e = restore_engine(reply)
+    e.session_batch_release = True
+    with pytest.raises(SessionProtocolError):
+        SessionProtocol(e).release_slot(1)
+    assert e._session_protocol_failed
+    e.proc.kill.assert_not_called()
+
+
+def test_release_capability_and_slot_validation_before_dispatch():
+    e = restore_engine()
+    for slot in [0, True, -1, 2]:
+        with pytest.raises(ValueError):
+            SessionProtocol(e).release_slot(slot)
+    e._send.assert_not_called()
+    e.session_batch_release = True
+    for slot in [True, -1, 2]:
+        with pytest.raises(ValueError):
+            SessionProtocol(e).release_slot(slot)
+    e._send.assert_not_called()
+
+
+def test_owned_routing_capability_requires_all_native_advertisements_and_precision():
+    e = StrataEngine.__new__(StrataEngine)
+    e.info = {key: '1' for key in ('session_export', 'session_export_batch',
+             'session_restore_batch', 'session_release_batch', 'session_route_batch')}
+    e.precision_policy_report = {'enforced': True}
+    assert e.session_batch_route
+    for key in list(e.info):
+        value = e.info.pop(key)
+        assert not e.session_batch_route
+        e.info[key] = value
+    e.precision_policy_report = None
+    assert not e.session_batch_route

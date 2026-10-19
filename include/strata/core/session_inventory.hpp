@@ -3,6 +3,7 @@
 #include "strata/core/conversation_cache.hpp"
 #include <limits>
 #include <charconv>
+#include <type_traits>
 #include <string>
 #include <vector>
 namespace strata::core {
@@ -57,6 +58,49 @@ inline bool session_slot_restore_ready(const std::vector<SessionInventorySlot>& 
         error = "restore target must be an empty, untainted slot"; return false;
     }
     return true;
+}
+inline bool session_slot_release_parse(const std::string& command, size_t count, size_t& slot, std::string& error) {
+    constexpr size_t prefix = 13; // "RELEASE_SLOT "
+    if (command.rfind("RELEASE_SLOT ", 0) != 0 || command.size() <= prefix) {
+        error = "expected RELEASE_SLOT <slot>"; return false;
+    }
+    size_t parsed = 0;
+    const auto result = std::from_chars(command.data() + prefix, command.data() + command.size(), parsed);
+    if (result.ec != std::errc() || result.ptr != command.data() + command.size() || parsed >= count ||
+        command.substr(prefix) != std::to_string(parsed)) {
+        error = "invalid release slot"; return false;
+    }
+    slot = parsed; return true;
+}
+inline bool session_slot_release_ready(const std::vector<SessionInventorySlot>& slots, size_t target,
+                                       bool supported, std::string& error) {
+    if (!supported || target >= slots.size()) { error = "batch slot release is not supported"; return false; }
+    for (const auto& slot : slots)
+        if (slot.active || slot.partial) { error = "batch must be fully quiescent before slot release"; return false; }
+    const auto& slot = slots[target];
+    if (!slot.layout_valid || !slot.tokens || !slot.cached || slot.tainted || slot.images) {
+        error = "release target must be a valid cached text slot"; return false;
+    }
+    return true;
+}
+// State owns only host metadata. Device allocations belong to the caller's separate session table.
+// A checked release is a no-throw metadata reset, leaving all neighboring slots alone.
+template<class Slot>
+bool session_slot_release(std::vector<Slot>& state, const std::vector<SessionInventorySlot>& slots,
+                          size_t target, bool supported, std::string& error) {
+    static_assert(std::is_nothrow_move_assignable_v<Slot>);
+    if (state.size() != slots.size() || !session_slot_release_ready(slots, target, supported, error)) return false;
+    Slot empty; // construct before touching the target; some clock types omit noexcept on construction
+    state[target] = std::move(empty);
+    return true;
+}
+// BGEN always reads exactly one output token before handing off. Its consumed prefix must therefore
+// equal the requested prompt; the first emitted token has not been consumed. Cancellations are ambiguous.
+template<class PromptToken>
+bool session_owned_prefix_valid(bool cancelled, bool nonfinite, bool live_ok, int64_t produced,
+                                const std::vector<int32_t>& live, const std::vector<PromptToken>& prompt) {
+    return !cancelled && !nonfinite && live_ok && produced == 1 && !live.empty() && live.size() == prompt.size() &&
+           std::equal(live.begin(), live.end(), prompt.begin());
 }
 class SessionInventory {
     std::string nonce_;

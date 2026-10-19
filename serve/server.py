@@ -1303,6 +1303,8 @@ class StrataEngine:
             elif line.startswith("DONE"):
                 self._parse_done(line)
                 self._last_done = line
+            elif line.startswith("BOWN "):
+                self._record_owned_prefix(line)
             elif line.startswith("BADM "):
                 f = line.split()
                 self._ctl_result_slot = f[1] if len(f) == 3 and f[2] in ('0', '1') else None
@@ -1324,6 +1326,15 @@ class StrataEngine:
         f = (getattr(self, "_last_done", None) or "").split()
         return f[5] if len(f) > 5 else None
 
+    def _record_owned_prefix(self, line):
+        """The owned BGEN publication proof, read while holding control lines."""
+        fields = line.split()
+        valid = (len(fields) == 3 and fields[1].isdigit() and fields[2].isdigit())
+        if getattr(self, '_ctl_owned_result', None) is not None or not valid:
+            self._ctl_owned_result = ('invalid', -1)
+        else:
+            self._ctl_owned_result = (int(fields[1]), int(fields[2]))
+
     def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None):
         """After a consumer left early: read the control lines up to the next `until` line (DONE or BADM) so the next
         request does not read this one's leftovers.  Returns that line (None: the engine ended or never answered).
@@ -1340,6 +1351,8 @@ class StrataEngine:
                 continue
             if line is None:
                 return None
+            if line.startswith("BOWN "):
+                self._record_owned_prefix(line)
             if line.startswith("DONE"):
                 self._parse_done(line)
             if line.startswith(until) or line.startswith("ERR"):
@@ -1370,6 +1383,25 @@ class StrataEngine:
             if line.startswith("BDONE "):
                 return line
         return None
+
+    @contextlib.contextmanager
+    def bound_slot(self, slot):
+        """Owner-only routing scope; wait for this exact slot, never spill over.
+
+        The coordinator owns cross-turn agent/slot assignment. This scope does
+        not reserve an idle slot between turns and is not an HTTP request option.
+        """
+        if (type(slot) is not int or slot < 0 or slot >= getattr(self, 'batch', 0)
+                or getattr(self, 'slot_groups', 1) != 1
+                or getattr(self, 'session_batch_route', False) is not True):
+            raise ValueError('bound slot requires a valid slot and native routing capability in an ungrouped batch lane')
+        local = self.__dict__.setdefault('_bound_slot_local', threading.local())
+        previous = getattr(local, 'slot', None)
+        local.slot = slot
+        try:
+            yield slot
+        finally:
+            local.slot = previous
 
     @contextlib.contextmanager
     def track_drain(self, receipt):
@@ -1620,9 +1652,24 @@ class StrataEngine:
         admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        bound = getattr(getattr(self, '_bound_slot_local', None), 'slot', None)
+        bound_generation = self.gen
+        if bound is not None and (type(bound) is not int or not 0 <= bound < self.batch
+                                  or getattr(self, 'slot_groups', 1) != 1
+                                  or getattr(self, 'session_batch_route', False) is not True):
+            raise ValueError('bound slot is not valid for this batch lane')
+
+        def choose_slot(prompt):
+            if bound is None:
+                return self.pick_slot(prompt)
+            if self.gen != bound_generation or bound >= len(self.slot_busy):
+                raise EngineDied('engine changed while waiting for the bound slot')
+            return None if self.slot_busy[bound] else bound
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})
+        if bound is not None:
+            keys += " lane_owned=1"
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
@@ -1646,6 +1693,19 @@ class StrataEngine:
                     raise EngineDied('engine generation changed during tracked request')
                 receipt.expect_slot(ticket, selected_slot)
             drain_safe, drain_slot = False, selected_slot
+        def accept_owned_prefix(selected_slot):
+            nonlocal drain_safe, phase
+            if bound is None:
+                return
+            if getattr(self, '_ctl_owned_result', None) != (selected_slot, len(prompt)):
+                drain_safe = False
+                phase = 'none'  # BADM was consumed; never wait for a second acknowledgement.
+                self._session_protocol_failed = True
+                if receipt is not None:
+                    receipt.mark_failed()
+                raise EngineDied('owned batch admission did not prove its retained prompt prefix')
+            self.slot_held[selected_slot] = list(prompt)
+
         btrace("ctl acquired")
         slot, gen0, reserved = None, None, None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
@@ -1661,7 +1721,7 @@ class StrataEngine:
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
-                if alone and left > 1:
+                if bound is None and alone and left > 1:
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
                     drain_start(None)
@@ -1678,7 +1738,7 @@ class StrataEngine:
                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
                             with self.slot_cv:          # the slot the part read will wait in
-                                reserved = self.pick_slot(prompt)
+                                reserved = choose_slot(prompt)
                                 if reserved is not None:
                                     self.slot_busy[reserved] = True
                                     self.slot_claims.add(reserved)
@@ -1727,7 +1787,7 @@ class StrataEngine:
                         # long, short at 0.25 s steps under parallel: 2 (ENGINE_REVIEW finding 1, reproduced in 0.1.41).
                         while True:
                             with self.slot_cv:
-                                slot = self.pick_slot(prompt)
+                                slot = choose_slot(prompt)
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
@@ -1742,7 +1802,7 @@ class StrataEngine:
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
-                                if self.pick_slot(prompt) is None:
+                                if choose_slot(prompt) is None:
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
                                         # the stall check of #1317 only watches a request on the control lines; one
                                         # waiting here is covered by looking for a slot nobody owns, and by saying so
@@ -1753,7 +1813,7 @@ class StrataEngine:
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
-                                if self.pick_slot(prompt) is None:
+                                if choose_slot(prompt) is None:
                                     self.slot_cv.wait(timeout=1.0)
                             if cancel.is_set():
                                 return
@@ -1781,6 +1841,7 @@ class StrataEngine:
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live
                     self._last_done = None                  # (#879: this admission's DONE decides below)
+                    self._ctl_owned_result = None
                     drain_start(slot)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
@@ -1792,7 +1853,7 @@ class StrataEngine:
 
                     def ask():        # as give_way above, for the slot this admission reads into
                         nonlocal asked
-                        if (not asked and not embeddings and yields < self.YIELDS_MAX and
+                        if (bound is None and not asked and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
                             self._send(f"BYIELD {slot}")
                             asked = True
@@ -1806,13 +1867,16 @@ class StrataEngine:
                                 ask()
                                 yield None
                     except ValueError as e:
+                        if bound is not None and not str(e).startswith("BGEN:"):
+                            self._session_protocol_failed = True
                         # #1994: the engine says this slot is not free (its view and ours differ for a moment, or a
                         # slot it still holds).  That is not the request's fault and nothing was read: park the slot
                         # for a moment (busy here too), and wait for another one - never a 400 for the conversation.
                         if not (self._ctl_erred and str(e).startswith("BGEN:") and left >= 1 and not cancel.is_set()):
                             raise
                         refused += 1
-                        print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
+                        retry_target = "the bound slot" if bound is not None else "another slot"
+                        print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying {retry_target} "
                               f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
                         if refused > self.BGEN_REFUSALS_MAX:
                             raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
@@ -1826,10 +1890,11 @@ class StrataEngine:
                         continue
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     drain_safe = bool(self._ctl_result and not cont)
-                    if receipt is not None and self._ctl_result_slot != str(slot):
+                    if (receipt is not None or bound is not None) and self._ctl_result_slot != str(slot):
                         drain_safe = False
                         phase = 'none'
                         raise EngineDied('batch admission acknowledged another or invalid slot')
+                    accept_owned_prefix(slot)
                     phase = "slot" if cont else "none"
                     while pending:
                         t = pending.pop(0)
@@ -1870,7 +1935,7 @@ class StrataEngine:
                                 stop_sent = True
                             continue
                         yield t
-                        if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
+                        if bound is None and not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
                                                                                   embeddings):
                             self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
                             going_solo = True
@@ -1920,10 +1985,19 @@ class StrataEngine:
                     drain_safe = bool(line and line.startswith('DONE '))
                 elif phase == "admit":
                     line = self._drain_control("BADM", born=born)
+                    if bound is not None and line and line.startswith('ERR'):
+                        drain_safe = False
+                        self._session_protocol_failed = True
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
+                        if bound is not None and line.split()[1:2] != [str(slot)]:
+                            drain_safe = False
+                            self._session_protocol_failed = True
+                            raise EngineDied('owned batch admission acknowledged another slot')
+                        accept_owned_prefix(slot)
                         phase = "slot"
                     elif (line and line.startswith('BADM ') and line.split()[2:3] == ['0']
-                          and (receipt is None or line.split()[1:2] == [str(slot)])):
+                          and ((receipt is None and bound is None) or line.split()[1:2] == [str(slot)])):
+                        accept_owned_prefix(slot)
                         drain_safe = True
             except EngineDied:
                 pass
@@ -2060,6 +2134,9 @@ class StrataEngine:
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        if (getattr(getattr(self, '_bound_slot_local', None), 'slot', None) is not None
+                and not getattr(self, 'batch', 0)):
+            raise EngineDied('bound-slot lane is no longer batched; this request was not sent')
         bias_api.validate_request(sampling or {}, self, None)
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
@@ -2242,6 +2319,19 @@ class StrataEngine:
     @property
     def session_batch_restore(self):
         return self.session_batch_export and self.info.get('session_restore_batch') in ('1', 1)
+
+    @property
+    def session_batch_release(self):
+        return self.session_batch_restore and self.info.get('session_release_batch') in ('1', 1)
+
+    @property
+    def session_batch_route(self):
+        return self.session_batch_release and self.info.get('session_route_batch') in ('1', 1)
+
+    def session_release_slot(self, slot):
+        """Forget a durably parked slot; caller owns FIFO, ctl, and admission gate."""
+        from serve.session_protocol import SessionProtocol
+        return SessionProtocol(self).release_slot(slot)
 
     def session_restore_slot(self, slot, path):
         """Restore an empty slot; caller gates admission and holds FIFO plus ctl."""
