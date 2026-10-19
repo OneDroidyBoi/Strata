@@ -220,6 +220,8 @@ def _component(name, paths, minimum, preferred, content_hash):
             out['errors'].append(f'{name}: missing/inconsistent shard metadata or tensor count')
     # Also detect missing standard filename shards even when split metadata was omitted.
     filenames = [re.match(r'^(.*)-(\d{5})-of-(\d{5})\.gguf$', h.path.name) for h in headers]
+    if len(headers) > 1 and not split and not any(filenames):
+        out['errors'].append(f'{name}: multiple files require coherent shard metadata or standard shard filenames')
     if any(filenames):
         if not all(filenames):
             out['errors'].append(f'{name}: mixed sharded and unsharded filenames')

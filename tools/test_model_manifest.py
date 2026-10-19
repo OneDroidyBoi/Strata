@@ -106,6 +106,14 @@ class ManifestTests(unittest.TestCase):
         path = fixture(self.root / 'm-00001-of-00002.gguf')
         self.assertFalse(M.build_manifest({'target': [path]})['policy_passed'])
 
+    def test_unrelated_unsharded_files_cannot_form_one_component(self):
+        meta = [('general.architecture', 8, 'qwen4exp')]
+        a = fixture(self.root / 'a.gguf', [('a', [32], 8, 0, 34)], meta)
+        b = fixture(self.root / 'b.gguf', [('b', [32], 8, 0, 34)], meta)
+        result = M.build_manifest({'target': [a, b]})
+        self.assertFalse(result['policy_passed'])
+        self.assertIn('multiple files require coherent shard', ' '.join(result['errors']))
+
     def test_draft_floor_and_required_scope(self):
         target = fixture(self.root / 't.gguf')
         draft = fixture(self.root / 'd.gguf', [('draft', [64], 42, 0, 18)])

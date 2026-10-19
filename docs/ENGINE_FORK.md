@@ -115,7 +115,7 @@ From the repository root:
 python -m unittest tools.test_model_manifest serve.test_backends tools.test_backend_preflight
 ```
 
-The initial suite has 35 passing tests on Python 3.12.14, using synthetic GGUF
+The initial suite has 36 passing tests on Python 3.12.14, using synthetic GGUF
 files and fake engines. Coverage includes low-bit draft rejection, unknown
 tensor roles, shard completeness, malformed headers, payload extents, optional
 hashing, input overwrite prevention, iterator cleanup, cancellation and explicit
