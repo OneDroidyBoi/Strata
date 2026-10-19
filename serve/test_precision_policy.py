@@ -6,7 +6,7 @@ import tempfile
 import struct
 import unittest
 
-from serve.precision_policy import enforce_launch_policy, PrecisionPolicyError
+from serve.precision_policy import enforce_launch_policy, PrecisionPolicyError, _q8_0_bf16_digest
 from tools import model_manifest as M
 from tools.test_model_manifest import fixture
 
@@ -55,8 +55,190 @@ class PrecisionLaunchTests(unittest.TestCase):
     def run_guard(self, args=None, env=None):
         return enforce_launch_policy(self.args if args is None else args, self.root, self.env if env is None else env)
 
+    def install_q8_compat_pack(self):
+        """Replace the ordinary fixture with one real Q8_0 source span and audited manifests."""
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest('numpy required for Q8 compatibility fixtures')
+
+        self.target = self.root / 'q8-model.gguf'
+        rows, offset = [], 0
+        for role in ('gate', 'up', 'down'):
+            rows.append((f'blk.0.ffn_{role}_exps.weight', [32, 32, 2], 2, offset, 1152))
+            offset += 1152
+        rows.extend([
+            ('blk.0.ffn_gate_inp.weight', [32, 2], 0, offset, 256),
+            ('norm.weight', [1], 0, offset + 256, 4),
+            ('output.weight', [32, 2], 8, offset + 288, 68),
+            ('per_layer_token_embd.weight', [160, 1], 20, offset + 384, 90),
+            ('blk.0.attn_q.weight', [32], 8, offset + 480, 34),
+        ])
+        fixture(self.target, rows, [('general.architecture', 8, 'qwen4exp')])
+        header = M.Header(self.target)
+        source = next(t for t in header.tensors if t.name == 'blk.0.attn_q.weight')
+        codes = np.array([0, 1, -1, 127, -128] + [0] * 27, dtype=np.int8)
+        q8 = struct.pack('<e', 0.3) + codes.tobytes()
+        with self.target.open('r+b') as f:
+            f.seek(header.data_start + source.offset)
+            f.write(q8)
+        values = np.float32(np.float16(0.3)) * codes.astype(np.float32)
+        bits = values.view(np.uint32)
+        converted = ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16).astype('<u2').tobytes()
+        _, error = _q8_0_bf16_digest(self.target, header.data_start + source.offset, len(q8))
+
+        (self.pack / 'native_experts.txt').write_text(
+            '# strata native experts v3: test (n_expert 2, total 3456; source)\n0 2 2 0 1728 '
+            + ' '.join(str(header.data_start + t.offset) for t in header.tensors[:3]) + '\n')
+        (self.pack / 'dense.bin').write_bytes(bytes(512) + converted)
+        record = {
+            'name': source.name, 'shard': self.target.name, 'src_type': 'Q8_0', 'dst_type': 'BF16',
+            'method': 'dequantize->bf16 round-to-nearest-even (--compat-bf16)',
+            'exact': False, 'max_abs_err': error, 'source_sha256': hashlib.sha256(q8).hexdigest(),
+        }
+        (self.pack / 'conversions.json').write_text(json.dumps({
+            'schema': 1, 'tool': 'tools/iq_pack.py', 'tensors': [record],
+        }))
+        (self.pack / 'compat-bf16.json').write_text(json.dumps({
+            'source': str(self.target.resolve()), 'rounding': 'nearest-even',
+            'tensors': [{'name': source.name, 'source_type': 'Q8_0', 'bytes': len(converted)}],
+        }))
+        packed_rows = [self.row('blk.0.ffn_gate_inp.weight', 2, 0, 256, 0, 256, 32, 2),
+                       self.row('norm.weight', 2, 256, 4, 256, 4, 1, 0),
+                       'output.weight 0 0 0 0 512 0 32 2 8 0 32 ' + ' '.join(['0'] * 7),
+                       self.row(source.name, 4, 512, len(converted), 512, len(converted), 32, 0)]
+        (self.pack / 'index.txt').write_text(
+            '# strata pack index v3 -- standalone\n# align 256 pool 768 tensors 4\n'
+            + '\n'.join(packed_rows) + '\n')
+        self.document['target'] = [self.target.name]
+        self.document['sha256'] = {
+            'pack/conversions.json': hashlib.sha256((self.pack / 'conversions.json').read_bytes()).hexdigest(),
+            'pack/compat-bf16.json': hashlib.sha256((self.pack / 'compat-bf16.json').read_bytes()).hexdigest(),
+        }
+        self.write_policy()
+        self.args = ['--native', str(self.target), '--pack', str(self.pack), '--spec', '4']
+
     def test_opt_out_does_not_inspect_inputs(self):
         self.assertIsNone(enforce_launch_policy(['--mtp', 'missing'], 'missing', {}))
+
+    def test_q8_rounding_reference_chunking_and_bad_sources(self):
+        # 257/256 times +/-1 are BF16 halfway cases; +/-3 rounds upward. Expected
+        # words are hand-derived ties-to-even, not produced by the validator.
+        try:
+            import numpy
+        except ImportError:
+            self.skipTest('numpy required for Q8 compatibility fixtures')
+        path = self.root / 'blocks.bin'
+        block = struct.pack('<e', 257 / 256) + struct.pack('32b', 1, 3, -1, -3, *([0] * 28))
+        expected = struct.pack('<32H', 0x3f80, 0x4041, 0xbf80, 0xc041, *([0] * 28))
+        path.write_bytes(block * 16385)
+        digest, error = _q8_0_bf16_digest(path, 0, 34 * 16385)
+        self.assertEqual(digest, hashlib.sha256(expected * 16385).digest())
+        self.assertEqual(error, 1 / 256)
+        for data, count in ((block[:-1], 34), (struct.pack('<e', float('inf')) + bytes(32), 34)):
+            path.write_bytes(data)
+            with self.assertRaises(PrecisionPolicyError):
+                _q8_0_bf16_digest(path, 0, count)
+
+    def test_reviewed_q8_0_to_bf16_conversion_is_deterministic_and_bounded(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest('numpy is not installed in this test interpreter')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'q8.bin'
+            codes = np.array([0, 1, -1, 127, -128] + [0] * 27, dtype=np.int8)
+            path.write_bytes(struct.pack('<e', 0.25) + codes.tobytes())
+            digest, err = _q8_0_bf16_digest(path, 0, 34)
+            values = np.float32(0.25) * codes.astype(np.float32)
+            bits = values.view(np.uint32)
+            expected = ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16).astype('<u2').tobytes()
+            self.assertEqual(digest, hashlib.sha256(expected).digest())
+            decoded = (np.frombuffer(expected, dtype='<u2').astype(np.uint32) << 16).view(np.float32)
+            self.assertAlmostEqual(err, float(np.max(np.abs(decoded.astype(np.float64) - values.astype(np.float64)))))
+            with self.assertRaises(PrecisionPolicyError):
+                _q8_0_bf16_digest(path, 0, 33)
+
+    def test_q8_compat_pack_manifest_boundary_and_source_payload_binding(self):
+        self.install_q8_compat_pack()
+        report = self.run_guard()
+        self.assertEqual(report['pack_audit']['q8_0_to_bf16_conversions'], 1)
+        self.assertGreater(report['pack_audit']['q8_0_to_bf16_max_abs_error'], 0.0)
+
+        conversions = self.pack / 'conversions.json'
+        compat = self.pack / 'compat-bf16.json'
+        original_conversion = json.loads(conversions.read_text())
+        original_compat = json.loads(compat.read_text())
+        mutations = [
+            (conversions, {**original_conversion, 'tensors': [{**original_conversion['tensors'][0], 'exact': True}]}, 'lacks matching'),
+            (conversions, {**original_conversion, 'tensors': [{**original_conversion['tensors'][0], 'shard': 'other.gguf'}]}, 'lacks matching'),
+            (compat, {**original_compat, 'tensors': [{**original_compat['tensors'][0], 'source_type': 'Q4_0'}]}, 'lacks matching'),
+            (conversions, {**original_conversion, 'tensors': []}, 'lacks matching'),
+            (compat, {**original_compat, 'tensors': []}, 'lacks matching'),
+            (compat, {**original_compat, 'tensors': original_compat['tensors'] * 2}, 'duplicate'),
+            (conversions, {**original_conversion, 'tensors': [{**original_conversion['tensors'][0], 'source_sha256': '0' * 64}]}, 'lacks matching'),
+            (conversions, {**original_conversion, 'tensors': [{**original_conversion['tensors'][0], 'max_abs_err': float('nan')}]}, 'lacks matching'),
+            (conversions, {**original_conversion, 'tensors': [{**original_conversion['tensors'][0], 'max_abs_err': float('inf')}]}, 'lacks matching'),
+            (compat, {**original_compat, 'tensors': original_compat['tensors'] + [{'name': 'other', 'bytes': 64}]}, 'do not exactly match'),
+        ]
+        for path, document, message in mutations:
+            with self.subTest(path=path.name, message=message):
+                conversions.write_text(json.dumps(original_conversion))
+                compat.write_text(json.dumps(original_compat))
+                path.write_text(json.dumps(document))
+                self.document['sha256']['pack/conversions.json'] = hashlib.sha256(conversions.read_bytes()).hexdigest()
+                self.document['sha256']['pack/compat-bf16.json'] = hashlib.sha256(compat.read_bytes()).hexdigest()
+                self.document['sha256'][f'pack/{path.name}'] = hashlib.sha256(path.read_bytes()).hexdigest()
+                self.write_policy()
+                with self.assertRaisesRegex(PrecisionPolicyError, message):
+                    self.run_guard()
+        conversions.write_text(json.dumps(original_conversion))
+        compat.write_text(json.dumps(original_compat))
+        self.document['sha256']['pack/conversions.json'] = hashlib.sha256(conversions.read_bytes()).hexdigest()
+        self.document['sha256']['pack/compat-bf16.json'] = hashlib.sha256(compat.read_bytes()).hexdigest()
+        self.write_policy()
+        with (self.pack / 'dense.bin').open('r+b') as f:
+            f.seek(512)
+            f.write(bytes([1]) + bytes(63))
+        with self.assertRaisesRegex(PrecisionPolicyError, 'differs'):
+            self.run_guard()
+
+    def test_exact_q8_compat_conversion(self):
+        self.install_q8_compat_pack()
+        header = M.Header(self.target)
+        source = next(t for t in header.tensors if t.name == 'blk.0.attn_q.weight')
+        raw = struct.pack('<e', 0.25) + struct.pack('32b', 1, -1, *([0] * 30))
+        with self.target.open('r+b') as f:
+            f.seek(header.data_start + source.offset)
+            f.write(raw)
+        with (self.pack / 'dense.bin').open('r+b') as f:
+            f.seek(512)
+            f.write(struct.pack('<32H', 0x3e80, 0xbe80, *([0] * 30)))
+        path = self.pack / 'conversions.json'
+        document = json.loads(path.read_text())
+        document['tensors'][0].update(exact=True, max_abs_err=0.0,
+                                     source_sha256=hashlib.sha256(raw).hexdigest())
+        path.write_text(json.dumps(document))
+        self.document['sha256']['pack/conversions.json'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        self.write_policy()
+        self.assertEqual(self.run_guard()['pack_audit']['q8_0_to_bf16_max_abs_error'], 0.0)
+
+    def test_q8_compat_pack_rejects_malformed_manifest_shape_and_hash_tampering(self):
+        self.install_q8_compat_pack()
+        compat = self.pack / 'compat-bf16.json'
+        compat.write_text('[]')
+        with self.assertRaises(PrecisionPolicyError):
+            self.run_guard()
+        self.install_q8_compat_pack()
+        conversions = self.pack / 'conversions.json'
+        conversions.write_text('[]')
+        with self.assertRaises(PrecisionPolicyError):
+            self.run_guard()
+        self.install_q8_compat_pack()
+        compat = self.pack / 'compat-bf16.json'
+        compat.write_text(compat.read_text() + ' ')
+        with self.assertRaisesRegex(PrecisionPolicyError, 'identity mismatch'):
+            self.run_guard()
 
     def test_complete_binding_passes(self):
         result = self.run_guard()

@@ -113,9 +113,11 @@ def _slice_digest(path, offset, count):
 
 
 def _converted_digest(path, offset, count, src, dst):
-    """Only reviewed float transforms; never dequantize/relabel low-bit tensors."""
+    """Reproduce only the reviewed float transforms and explicit Q8_0 compatibility conversion."""
     if src == dst:
         return _slice_digest(path, offset, count)
+    if (src, dst) == ('Q8_0', 'BF16'):
+        return _q8_0_bf16_digest(path, offset, count)[0]
     if (src, dst) not in {('F32', 'BF16'), ('F16', 'F32'), ('BF16', 'F32')}:
         _fail(f'unreviewed pack conversion {src}->{dst}')
     size = 4 if src == 'F32' else 2
@@ -139,6 +141,50 @@ def _converted_digest(path, offset, count, src, dst):
                     out.extend(struct.pack('<f', struct.unpack('<e', struct.pack('<H', bits))[0]))
             digest.update(out)
     return digest.digest()
+
+
+def _q8_0_bf16_digest(path, offset, count):
+    """Reproduce iq_pack.py's explicit Q8_0 -> BF16 --compat-bf16 conversion.
+
+    Q8_0 blocks are a little-endian fp16 scale followed by 32 signed codes.
+    This path is admitted only alongside matching conversion and
+    compat manifests in _pack; a quantized source is never silently widened.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        _fail('numpy is required to audit the reviewed Q8_0->BF16 pack transform')
+    if count % 34:
+        _fail('Q8_0 source span is not a whole number of blocks')
+    digest, max_error = hashlib.sha256(), 0.0
+    block = np.dtype([('d', '<f2'), ('qs', 'i1', (32,))])
+    with Path(path).open('rb') as f:
+        f.seek(offset)
+        while count:
+            size = min(count, 34 * 16384)
+            raw = f.read(size)
+            if len(raw) != size:
+                _fail('truncated Q8_0 source span')
+            count -= size
+            blocks = np.frombuffer(raw, dtype=block)
+            if not np.isfinite(blocks['d']).all():
+                _fail('non-finite Q8_0 scale is not admitted')
+            values = (blocks['d'].astype(np.float32)[:, None] *
+                      blocks['qs'].astype(np.float32)).reshape(-1)
+            if not np.isfinite(values).all():
+                _fail('non-finite Q8_0 dequantization is not admitted')
+            bits = values.view(np.uint32)
+            rounded = bits + 0x7fff + ((bits >> 16) & 1)
+            encoded = (rounded >> 16).astype('<u2')
+            decoded = (encoded.astype(np.uint32) << 16).view(np.float32)
+            max_error = max(max_error, float(np.max(np.abs(
+                decoded.astype(np.float64) - values.astype(np.float64)))))
+            digest.update(encoded.tobytes())
+    return digest.digest(), max_error
+
+
+def _slice_sha256(path, offset, count):
+    return _slice_digest(Path(path), offset, count).hex()
 
 
 def _pack(pack, native_first, tensors, floor):
@@ -207,6 +253,33 @@ def _pack(pack, native_first, tensors, floor):
     if not index.startswith('# strata pack index v3'):
         _fail('only standalone native pack index v3 is admitted')
     expected = set(tensors) - {n for n in tensors if EXPERT.fullmatch(n)} - {TABLE}
+    conversion_path = pack / 'conversions.json'
+    compat_path = pack / 'compat-bf16.json'
+    conversions = _json(conversion_path) if conversion_path.is_file() else None
+    compat = _json(compat_path) if compat_path.is_file() else None
+    conversion_records = {}
+    if conversions is not None:
+        if (not isinstance(conversions, dict) or conversions.get('schema') != 1
+                or conversions.get('tool') != 'tools/iq_pack.py'):
+            _fail('unsupported pack conversion manifest')
+        records = conversions.get('tensors', [])
+        if not isinstance(records, list):
+            _fail('pack conversion manifest tensor list is malformed')
+        for record in records:
+            if not isinstance(record, dict) or not isinstance(record.get('name'), str) or record['name'] in conversion_records:
+                _fail('pack conversion manifest has malformed or duplicate tensor records')
+            conversion_records[record['name']] = record
+    compat_rows = {}
+    if compat is not None:
+        if (not isinstance(compat, dict) or compat.get('rounding') != 'nearest-even'
+                or compat.get('source') != str(native_first)
+                or not isinstance(compat.get('tensors'), list)):
+            _fail('unsupported compat-bf16 manifest')
+        for record in compat['tensors']:
+            if not isinstance(record, dict) or not isinstance(record.get('name'), str) or record['name'] in compat_rows:
+                _fail('compat-bf16 manifest has malformed or duplicate tensor records')
+            compat_rows[record['name']] = record
+    q8_converted, q8_max_error = set(), 0.0
     seen, spans = set(), []
     dense = pack / 'dense.bin'
     dense_size = dense.stat().st_size
@@ -253,7 +326,29 @@ def _pack(pack, native_first, tensors, floor):
             _fail('packed float payload byte count mismatch')
         if off % alignment or off + size > dense_size:
             _fail('packed float span is unaligned/truncated')
-        if _converted_digest(h.path, h.data_start + t.offset, t.expected_bytes(), t.type_name, storage) != _slice_digest(dense, off, size):
+        if (t.type_name, storage) == ('Q8_0', 'BF16'):
+            record = conversion_records.get(name)
+            compat_record = compat_rows.get(name)
+            source_sha = _slice_sha256(h.path, h.data_start + t.offset, t.expected_bytes())
+            converted_hash, converted_error = _q8_0_bf16_digest(h.path, h.data_start + t.offset,
+                                                                t.expected_bytes())
+            if (not isinstance(record, dict) or record.get('src_type') != 'Q8_0'
+                    or record.get('dst_type') != 'BF16'
+                    or record.get('method') != 'dequantize->bf16 round-to-nearest-even (--compat-bf16)'
+                    or record.get('exact') is not (converted_error == 0.0) or record.get('source_sha256') != source_sha
+                    or record.get('shard') != h.path.name
+                    or not isinstance(record.get('max_abs_err'), (int, float))
+                    or not math.isclose(float(record['max_abs_err']), converted_error, rel_tol=1e-6, abs_tol=1e-7)
+                    or not isinstance(compat_record, dict)
+                    or compat_record.get('source_type') != 'Q8_0'
+                    or compat_record.get('bytes') != math.prod(t.shape) * M.GEOMETRY['BF16'][1]):
+                _fail(f'Q8_0->BF16 conversion lacks matching audited compat manifests: {name}')
+            q8_converted.add(name)
+            q8_max_error = max(q8_max_error, converted_error)
+            actual_digest = converted_hash
+        else:
+            actual_digest = _converted_digest(h.path, h.data_start + t.offset, t.expected_bytes(), t.type_name, storage)
+        if actual_digest != _slice_digest(dense, off, size):
             _fail(f'packed payload differs from audited source/conversion: {name}')
         spans.append((off, off + size))
     if seen != expected or int(header[3]) != len(seen) or int(header[2]) != dst_end:
@@ -261,8 +356,13 @@ def _pack(pack, native_first, tensors, floor):
     spans.sort()
     if any(b[0] < a[1] for a, b in zip(spans, spans[1:])):
         _fail('packed float spans overlap')
+    q8_manifest_names = {name for name, record in conversion_records.items()
+                         if record.get('src_type') == 'Q8_0' and record.get('dst_type') == 'BF16'}
+    if q8_manifest_names != q8_converted or set(compat_rows) != q8_converted:
+        _fail('Q8_0->BF16 conversion manifests do not exactly match packed tensors')
     return {'expert_layers': len(by_layer), 'expert_bytes': running, 'pack_tensors': len(seen),
-            'packed_payload_verified_against_source': True}
+            'packed_payload_verified_against_source': True,
+            'q8_0_to_bf16_conversions': len(q8_converted), 'q8_0_to_bf16_max_abs_error': q8_max_error}
 
 
 def enforce_launch_policy(args, cwd, env):
@@ -332,7 +432,8 @@ def enforce_launch_policy(args, cwd, env):
         hashes = policy.get('sha256', {})
         if not isinstance(hashes, dict):
             _fail('sha256 must map paths to expected full-file digests')
-        admitted = set(paths) | {pack / n for n in ('index.txt', 'dense.bin', 'native_experts.txt')}
+        admitted = set(paths) | {pack / n for n in ('index.txt', 'dense.bin', 'native_experts.txt',
+                                                       'conversions.json', 'compat-bf16.json')}
         admitted.update(inputs.get('ple', []))
         for raw, digest in hashes.items():
             path = _path(raw, policy_path.parent)
