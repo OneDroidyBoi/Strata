@@ -2478,7 +2478,7 @@ class StrataEngine:
                     self.pump.join(timeout=2)
                 try:
                     self.proc.stdin.close()             # buffered data may flush again after the engine has exited
-                except OSError:
+                except (OSError, ValueError):
                     pass
                 self.proc.stdout.close()
                 if self.log not in (None, subprocess.DEVNULL):

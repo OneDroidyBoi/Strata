@@ -81,6 +81,30 @@ class Lifecycle(unittest.TestCase):
                 proc.kill.assert_not_called()
                 engine.close()                          # repeated cleanup is harmless
 
+    def test_close_tolerates_stdin_wrapper_rejecting_duplicate_close(self):
+        class CloseOnce(io.StringIO):
+            def close(self):
+                if self.closed:
+                    raise ValueError("I/O operation on closed file.")
+                super().close()
+        for running in (False, True):
+            with self.subTest(running=running):
+                engine = StrataEngine("missing-executable", [], lazy=True)
+                stdin = CloseOnce()
+                if not running:
+                    stdin.close()
+                proc = mock.Mock(stdin=stdin, stdout=io.StringIO())
+                proc.poll.side_effect = [None if running else 0, 0]
+                engine.proc, engine.log = proc, io.StringIO()
+                engine.close()
+                self.assertTrue(proc.stdout.closed)
+                self.assertTrue(engine.log.closed)
+                self.assertIsNone(engine.proc)
+                self.assertTrue(engine.ended)
+                proc.terminate.assert_not_called()
+                proc.kill.assert_not_called()
+                engine.close()
+
     def test_close_sends_eof_before_waiting_for_windows_reader(self):
         engine = StrataEngine("missing-executable", [], lazy=True)
         proc = mock.Mock()

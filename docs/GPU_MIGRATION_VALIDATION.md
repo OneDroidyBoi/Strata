@@ -96,6 +96,24 @@ not graceful completion. Do not call server_close from one of its own handlers.
 The regression holds a handler open and verifies that managed server_close cannot
 return until it completes, without sockets or GPUs. Targeted tests: 73 passed.
 
+### Post-exit stdin cleanup
+
+`StrataEngine.close()` now tolerates ValueError as well as OSError when closing
+stdin during final cleanup after confirmed process exit. The QUIT path has
+already closed stdin. A wrapper that rejects duplicate close must not prevent
+stdout/log cleanup, clearing the process handle and lane retirement. Tests cover
+both normal QUIT and an already-exited process with already-closed stdin, plus
+retention of a process that remains alive. This is separate from HTTP handler
+joining; it does not make concurrent calls to engine.close safe.
+
+The runner reports a 125.378-second operation against a 120-second client timeout.
+Its proposed 300-second consolidation-only socket timeout leaves JSON timeout_s
+and safety deadlines unchanged. This is a client wait allowance, not a guarantee
+that migration completes in 300 seconds. Keep durable server work joined before
+ordinary cleanup. The duplicate-close reproducer uses a stream wrapper; standard
+Python streams normally allow repeated close, so retain runtime traceback/wrapper
+identity before attributing the GPU incident conclusively to this path.
+
 ## Isolation and precision gates
 
 1. Inventory GPU UUIDs, processes, reserved devices, free VRAM, host RAM and disk
