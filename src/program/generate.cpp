@@ -10442,6 +10442,8 @@ int main(int argc, char** argv) {
             const char* value = std::getenv("STRATA_SESSION_EXPORT");
             return value && std::string(value) == "1";
         }();
+        const bool session_export_batch = session_export_enabled && o.batch > 0 && o.batch_groups == 1 &&
+            stages.empty() && !multi_gpu && o.peer_device < 1 && !use_mtp && !batch_mtp;
         // A fresh random process nonce prevents stale IDs crossing engine restarts.
         strata::core::SessionInventory session_inventory(session_export_enabled ? [] {
             std::random_device random;
@@ -10496,6 +10498,7 @@ int main(int argc, char** argv) {
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "",
+                        session_export_batch ? " session_export=1 session_export_batch=1" :
                         session_export_enabled ? " session_export=1" : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
@@ -11318,11 +11321,12 @@ int main(int argc, char** argv) {
             }
             // Opt-in lifecycle protocol. INVENTORY emits one generation-bound list (including parked branches).
             // EXPORT <generation> <id> <path> uses SAVE's writer without reclaim or cache/LRU mutations. All
-            // checkpoint/recurrent bytes are retained. Batch slot state and split stages do NOT have the same
-            // snapshot layout; refuse the entire inventory, even when those slots currently appear idle.
+            // checkpoint/recurrent bytes are retained. Single-GPU target-only idle slots use their own session
+            // pointers. Active, partial, tainted slots and split/grouped layouts reject the entire inventory.
             const bool inventory_command = line == "INVENTORY";
             const bool export_command = line.rfind("EXPORT ", 0) == 0;
             const strata::core::SavedConversation* export_parked = nullptr;
+            int export_slot = -1;
             if (session_export_enabled && !inventory_command && !export_command) session_inventory.invalidate();
             if (inventory_command || export_command) {
                 auto inventory_error = [&](const std::string& why) {
@@ -11331,10 +11335,22 @@ int main(int argc, char** argv) {
                 if (!session_export_enabled) { inventory_error("session export is disabled"); continue; }
                 std::vector<strata::core::SessionInventoryEntry> entries;
                 std::string why;
-                const bool supported = stages.empty() && !multi_gpu && o.peer_device < 1 && o.batch == 0 &&
+                const bool supported = stages.empty() && !multi_gpu && o.peer_device < 1 && (o.batch == 0 || session_export_batch) &&
                                        o.prompt_cache > 0 && (live_ok || checks.empty()) && (!live.empty() || checks.empty());
                 try {
                     if (!session_inventory.collect(conversations, supported, live_ok, live.size(), entries, why)) {
+                        inventory_error(why); continue;
+                    }
+                    std::vector<strata::core::SessionInventorySlot> slots;
+                    for (size_t b = 0; b < bs.size(); ++b) {
+                        const auto& sl = bs[b];
+                        bool valid = bslot_ss.size() == 1 && b < bslot_ss[0].size() && bslot_ss[0][b] != nullptr;
+                        for (const auto& cp : sl.checks)
+                            valid = valid && cp.stage_parts.empty() && cp.imgs.empty();
+                        slots.push_back({b, sl.ids.size(), sl.checks.size(), sl.active, sl.cached,
+                                         sl.partial, sl.tainted, sl.img, valid});
+                    }
+                    if (!strata::core::session_inventory_append_slots(slots, entries, why)) {
                         inventory_error(why); continue;
                     }
                 } catch (const std::bad_alloc&) {
@@ -11363,6 +11379,9 @@ int main(int argc, char** argv) {
                         if (key == "parked-" + std::to_string(serial)) export_parked = &image;
                     });
                 }
+                if (entry->kind == "slot")
+                    for (size_t b = 0; b < bs.size(); ++b)
+                        if (key == "slot-" + std::to_string(b)) export_slot = (int) b;
                 line = "SAVE " + line.substr(second + 1);
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
@@ -11491,7 +11510,7 @@ int main(int argc, char** argv) {
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
-                if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
+                if (o.batch > 0 && !export_command) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
@@ -11532,7 +11551,14 @@ int main(int argc, char** argv) {
                     std::fflush(stdout); continue;
                 }
                 if (save) {
-                    if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
+                    // Capture a drained slot directly: no copy_from_slot, no live restore, no LRU or cache edits.
+                    const auto& save_ss = export_slot >= 0 ? *bslot_ss[0][(size_t) export_slot] : ss;
+                    const auto& save_ids = export_slot >= 0 ? bs[(size_t) export_slot].ids : live;
+                    const auto& save_checks = export_slot >= 0 ? bs[(size_t) export_slot].checks : checks;
+                    const std::vector<strata::core::ConversationImageKey> no_images;
+                    const auto& save_imgs = export_slot >= 0 ? no_images : live_imgs;
+                    const bool save_cvec = export_slot >= 0 ? bs[(size_t) export_slot].cvec : cvec_cached;
+                    if ((export_slot < 0 && !live_ok) || save_ids.empty()) { refuse("no complete session to save"); continue; }
                     size_t bytes = 0, kept = 0;
                     double capture_ms = 0;
                     try {
@@ -11547,15 +11573,15 @@ int main(int argc, char** argv) {
                             strata::core::ConversationStateSizes z;
                             std::string why;
                             uint64_t state = UINT64_MAX;   // unknown sizes: the preflight refuses rather than guesses
-                            if (strata::core::conversation_session_sizes(g, ss, z, why)) {
-                                const uint64_t q = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0);
+                            if (strata::core::conversation_session_sizes(g, save_ss, z, why)) {
+                                const uint64_t q = (uint64_t) std::max<int64_t>(save_ss.qsa_alloc, 0);
                                 const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
                                 if (q == 0 || per <= (UINT64_MAX - z.gdn - z.ple) / q) state = z.gdn + z.ple + q * per;
                             }
                             sl.state_bytes = state;
-                            sl.tokens = live.size();
-                            sl.images = live_imgs.size();
-                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+                            sl.tokens = save_ids.size();
+                            sl.images = save_imgs.size();
+                            sl.kv_layers = (uint64_t) std::max<int64_t>(save_ss.qsa_alloc, 0) + ((use_mtp || !session_export_enabled) ? 1 : 0);
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         if (o.session_save_reclaim && !export_command) {
@@ -11583,13 +11609,13 @@ int main(int argc, char** argv) {
                         };
                         std::vector<ConvCheckpoint> disk_checks;
                         std::string why;
-                        if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why)) {
+                        if (!strata::core::session_save_checkpoints(save_checks, sl, admit, disk_checks, why)) {
                             refuse(why, strata::core::SessionError::memory);
                             continue;
                         }
                         if (export_command) {
                             uint64_t extra = 0;
-                            for (const auto& cp : checks) {
+                            for (const auto& cp : save_checks) {
                                 if (cp.bytes() > (UINT64_MAX - extra) / 2) { extra = UINT64_MAX; break; }
                                 extra += 2 * cp.bytes();
                             }
@@ -11597,15 +11623,15 @@ int main(int argc, char** argv) {
                             if (extra > UINT64_MAX - peak || !admit(peak + extra, why)) {
                                 refuse("not enough RAM to export every checkpoint", strata::core::SessionError::memory); continue;
                             }
-                            disk_checks = checks;
+                            disk_checks = save_checks;
                         }
                         kept = disk_checks.size();
-                        const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
+                        const strata::core::ConversationView view{save_ids, save_imgs, disk_checks, save_cvec};
                         strata::core::SavedConversation meta;
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, save_ss, g, (use_mtp || !session_export_enabled) ? &mtp.kv_state() : nullptr,
                                                                          err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -11628,9 +11654,9 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
-                                 "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
+                                 "in %.1f ms (state %.1f ms)\n", save_ids.size(), kept, save_checks.size(), bytes,
                                  path.c_str(), ms(), capture_ms);
-                    std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
+                    std::printf("SAVED %zu %zu %.1f\n", save_ids.size(), bytes, ms());
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
@@ -11651,7 +11677,7 @@ int main(int argc, char** argv) {
                             return false;
                         };
                         if (!strata::core::conversation_session_read_limits(
-                                limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                limits, ss, g, (use_mtp || !session_export_enabled) ? &mtp.kv_state() : nullptr, (uint64_t) o.max_context,
                                 (uint64_t) std::max(o.prompt_cache, 1), err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -11668,7 +11694,7 @@ int main(int argc, char** argv) {
                     const double read_ms = ms();
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
+                    if (!strata::core::conversation_snapshot_validate(image, ss, g, (use_mtp || !session_export_enabled) ? &mtp.kv_state() : nullptr, err)) {
                         refuse(err);
                         continue;
                     }
@@ -11681,7 +11707,7 @@ int main(int argc, char** argv) {
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
+                    if (strata::core::conversation_snapshot_restore(image, ss, g, (use_mtp || !session_export_enabled) ? &mtp.kv_state() : nullptr, err) !=
                         strata::core::ConversationRestore::restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again

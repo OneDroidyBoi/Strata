@@ -2,7 +2,7 @@
 
 serve.native_lane supplies a restricted opt-in native mapping over inventory and
 export commands. Backend capability flags remain false pending GPU qualification;
-native batch-slot checkpoint coverage is not implied by this generic lifecycle.
+supported batch layouts are enforced by the native mapping, not this generic lifecycle.
 """
 from __future__ import annotations
 

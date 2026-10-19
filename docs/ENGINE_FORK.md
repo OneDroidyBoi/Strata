@@ -18,8 +18,8 @@ branch, not a replacement for an installed Strata server.
 - Enforces an optional precision policy before native construction and restart,
   and explicit resource reservations around the supported request path.
 - Adds durable checkpoint storage and an injected-worker persist-and-stop
-  lifecycle, plus a native live/parked-session mapping for the supported unbatched
-  layout. Batch-slot export and GPU qualification remain separate gates.
+  lifecycle, plus native live/parked/batch-slot mappings for supported layouts.
+  GPU qualification remains a separate gate.
 
 The backend adapter, launch precision policy, resource ledger and checkpoint
 controller are separate opt-in components. None changes numerical kernels or
@@ -276,16 +276,25 @@ ready worker rather than pretending the old process has restarted.
 
 The opt-in native implementation uses `STRATA_SESSION_EXPORT=1` and advertises
 `INFO session_export=1`. `INVENTORY` returns a process/epoch generation and every
-live or parked session in the supported layout. `EXPORT <generation> <id> <path>`
+live, parked or retained batch-slot session in the supported layout.
+`EXPORT <generation> <id> <path>`
 rejects stale generations and writes that exact session without evicting others.
 Live export retains every checkpoint and disables SAVE's optional reclamation;
 parked export reads its existing host image directly. Ordinary commands invalidate
 the inventory generation. No transcript or token text appears in the inventory.
 
-This first native checkpoint layout is **single-GPU, unbatched qwen4exp with
-prompt caching enabled and learned MTP disabled**. Batch slots, layer splits,
-peer GPUs, incomplete live state and unsupported parked state reject the whole
-inventory. Batched admission support does not imply batched checkpoint support.
+Supported native checkpoint layouts are **single-GPU qwen4exp, unbatched or one
+batch group, with prompt caching enabled and learned MTP disabled**. A supporting
+batch binary advertises `INFO session_export_batch=1`; old binaries are rejected.
+Slots have IDs `slot-N` and inventory kind `slot`. The exporter reads each slot's
+own session buffers directly, preserving the live session and every other slot.
+The target-only serialization path omits the absent draft KV layer consistently
+in capture, read limits, validation and restoration. Legacy opt-out calls retain
+their existing draft-reference behavior.
+
+Active, partial, tainted, image-bearing, half-written or unsupported slots reject
+the entire inventory. Empty unused slots need no file; every usable retained slot
+does. Layer splits, peer GPUs and multiple batch groups remain unsupported.
 Native CPU tests round-trip stored KV/recurrent/PLE/tail state; the GPU capture
 and restore paths have not yet been built or qualified on CUDA, HIP or SYCL here.
 The generic backend capability flags remain false pending that qualification.
@@ -308,19 +317,24 @@ result = worker.persist_and_stop(CheckpointStore(checkpoint_directory), timeout_
 # Only result.state == "stopped" confirms publication and process exit.
 ```
 
-The worker gates requests, drains leases, holds the service FIFO, exports all
+The worker gates requests, drains leases, holds the service FIFO and (for batch
+engines) the batch control lock, waits for slot-cleanup bookkeeping, exports all
 sessions, rechecks the generation, publishes the bundle and confirms process exit
 before retiring fixed memory charges. Ordinary load/unload, slot-file and VRAM
 controls are gated too. Failed export or protocol framing leaves the lane gated;
 protocol failure does not kill the engine or permit a legacy restore retry.
 
-Restoration uses a new ready compatible worker and its `lazy_restore` operation,
+Restoration currently uses a new ready compatible **unbatched** worker and its `lazy_restore` operation,
 selecting an ID from the published bundle. Admission remains gated until its owner
 reconciles restored state and registers valid resource ownership. This is a Python
 owner API, not an automatic signal handler, HTTP session router or 3-to-1 lane
-migration controller. Mapping agent identities to saved sessions and batch-slot
-state serialization remain separate work. Checkpoints preserve reusable context
-between requests; they do not promise resumption midway through a sampled reply.
+migration controller. Mapping agent identities to saved sessions and restoring
+directly into concurrent destination slots remain separate work. Slot files can
+restore into an unbatched lane only with the same model, context/KV layout and
+other state-compatible configuration. Checkpoints preserve reusable computational
+prefixes between requests. They do not save active-generation sampling/counters,
+the last emitted but not yet consumed token, cache pinning policy or a partial
+prompt's execution plan; they do not resume a sampled reply midway through it.
 
 ## Validation
 
@@ -329,7 +343,7 @@ From the repository root, run the CPU-only suites relevant to these components:
 ```sh
 python -m pip install jinja2==3.1.6 pytest==8.4.2
 python -m pytest -q tools/test_model_manifest.py serve/test_backends.py tools/test_backend_preflight.py serve/test_precision_policy.py serve/test_runtime_precision.py serve/test_resource_admission.py serve/test_request_admission.py serve/test_lane_lifecycle.py
-python -m pytest -q serve/test_slot_drain.py serve/test_session_protocol.py serve/test_native_lane.py serve/test_native_lane_controls.py
+python -m pytest -q serve/test_slot_drain.py serve/test_session_protocol.py serve/test_native_lane.py serve/test_native_lane_controls.py serve/test_batch_checkpoint.py
 python -m pytest -q serve/test_quiet_cancel.py serve/test_request_accounting.py serve/test_replicas.py serve/test_lifecycle.py
 ```
 
@@ -341,6 +355,12 @@ Consult the current test output for counts. These tests do not qualify native
 checkpoint coverage, power-loss recovery on every filesystem, numerical execution,
 SM70 compatibility, Q8 fit or performance. No GPU backend build is implied.
 
+The existing GPU target `conversation_snapshot_test` now also covers target-only
+slot streaming, independent unbatched restoration, and unchanged source KV and
+recurrent state. It is added for the runner once an isolated GPU is available;
+it has not run locally. Qualify real multi-agent checkpoint/restore and resumed
+continuation equivalence before enabling this on a serving lane.
+
 ## Next implementation gates
 
 1. Qualify the opt-in runtime hooks using actual launch and request inputs; keep
@@ -348,8 +368,8 @@ SM70 compatibility, Q8 fit or performance. No GPU backend build is implied.
 2. Qualify per-slot drain receipts on an isolated runner lane and calibrate peak
    reservations before extending beyond the single-lane text-only scope.
 3. Harden shared expert-store publication/attach semantics with immutable identity.
-4. Build every affected GPU backend and qualify native export/restore; then add
-   batch-slot state serialization and agent-to-checkpoint ownership routing.
+4. Build every affected GPU backend and qualify batch export/unbatched restore;
+   then add destination-slot restoration and agent-to-checkpoint ownership routing.
 5. Qualify another architecture and, with the benchmark runner, useful deep-context
    concurrency and lane-count transitions. A generic metadata type is not support
    for another model's executor or state format.

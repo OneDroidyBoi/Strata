@@ -1,5 +1,6 @@
 """Native lane ownership integration with a fake protocol engine; CPU/files only."""
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -36,6 +37,7 @@ class Engine:
         self.model_identity = model
         self.fifo = fifo
         self.proc = Process()
+        self.gen = 1
         self.precision_policy_report = {
             'enforced': True, 'draft': 'disabled',
             'artifact_audit': {'policy_passed': True,
@@ -82,6 +84,38 @@ class Engine:
         assert self.fifo.locked()
         assert action == 'restore'
         self.restores.append(Path(path).read_bytes())
+
+
+class BatchEngine(Engine):
+    batch = 2
+    session_batch_export = True
+    slot_groups = 1
+
+    def __init__(self, model, fifo):
+        super().__init__(model, fifo)
+        self.ctl = threading.Lock()
+        self.slot_cv = threading.Condition()
+        self.waiting = self.admitting = 0
+        self.wait_lens = []
+        self.slot_claims = set()
+        self.slot_releasing = set()
+        self.slot_busy = [False, False]
+        self.slot_live = [None, None]
+        self.slot_held = [[1, 2], [3, 4]]
+        self.entries.extend([{'id': 'slot-0', 'kind': 'slot', 'tokens': 10},
+                             {'id': 'slot-1', 'kind': 'slot', 'tokens': 20}])
+
+    def session_inventory(self):
+        assert self.ctl.locked()
+        return super().session_inventory()
+
+    def session_export(self, generation, sid, path):
+        assert self.ctl.locked()
+        return super().session_export(generation, sid, path)
+
+    def close(self):
+        assert self.ctl.locked()
+        return super().close()
 
 
 class NativeLaneTests(unittest.TestCase):
@@ -238,6 +272,147 @@ class NativeLaneTests(unittest.TestCase):
             self.assertEqual(result.state, 'blocked')
             self.assertEqual(self.engine.close_count, 0)
         self.assertFalse(self.service.fifo.locked())
+
+
+class NativeBatchLaneTests(unittest.TestCase):
+    setUp = NativeLaneTests.setUp
+    def batch_lane(self):
+        service = SimpleNamespace(fifo=threading.Lock(), request_admission=admission())
+        service.engine = BatchEngine(self.model, service.fifo)
+        return service, NativeLaneWorker(service, self.model, enabled=True)
+
+    def test_batch_exports_all_idle_cached_slots_under_both_locks(self):
+        service, worker = self.batch_lane()
+        result = worker.persist_and_stop(self.store)
+        self.assertEqual(result.state, 'stopped', result.error)
+        entries = self.store.sessions(result.checkpoint_id, self.model)
+        self.assertEqual({s.session_id for s in entries},
+            {'process1-epoch2:live', 'process1-epoch2:parked-1',
+             'process1-epoch2:slot-0', 'process1-epoch2:slot-1'})
+        self.assertEqual(service.engine.close_count, 1)
+        self.assertFalse(service.fifo.locked())
+        self.assertFalse(service.engine.ctl.locked())
+        self.assertEqual(service.request_admission.ledger.snapshot()['host_bytes'], 0)
+
+    def test_batch_inventory_cannot_omit_known_cached_slot(self):
+        service, worker = self.batch_lane()
+        service.engine.entries = [e for e in service.engine.entries if e['id'] != 'slot-1']
+        result = worker.persist_and_stop(self.store)
+        self.assertEqual(result.state, 'blocked')
+        self.assertIn('omitted a known cached slot', result.error)
+        self.assertEqual(service.engine.close_count, 0)
+        self.assertFalse(service.fifo.locked())
+        self.assertFalse(service.engine.ctl.locked())
+
+    def test_batch_unresolved_ownership_never_inventories_or_stops(self):
+        cases = {'waiting': 1, 'admitting': 1, 'wait_lens': [[5, 0, True]],
+                 'slot_claims': {0}, 'slot_releasing': {1},
+                 'slot_busy': [False, True], 'slot_live': [None, {}]}
+        for name, value in cases.items():
+            with self.subTest(name=name):
+                service, worker = self.batch_lane()
+                setattr(service.engine, name, value)
+                result = worker.persist_and_stop(self.store, timeout_s=0)
+                self.assertEqual(result.state, 'blocked')
+                self.assertEqual(service.engine.inventory_calls, 0)
+                self.assertEqual(service.engine.close_count, 0)
+                self.assertFalse(service.fifo.locked())
+                self.assertFalse(service.engine.ctl.locked())
+                self.assertEqual(service.request_admission.ledger.snapshot()['host_bytes'], 10)
+
+    def test_batch_waits_for_receipt_cleanup_bookkeeping(self):
+        service, worker = self.batch_lane()
+        waiting = threading.Event()
+        class ObservedCondition(threading.Condition):
+            def wait(self, timeout=None):
+                waiting.set()
+                return super().wait(timeout)
+        service.engine.slot_cv = ObservedCondition()
+        service.engine.slot_busy[0] = True
+        service.engine.slot_releasing.add(0)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(worker.persist_and_stop, self.store, 2)
+            self.assertTrue(waiting.wait(1))
+            self.assertTrue(service.fifo.locked())
+            self.assertTrue(service.engine.ctl.locked())
+            with service.engine.slot_cv:
+                service.engine.slot_busy[0] = False
+                service.engine.slot_releasing.clear()
+                service.engine.slot_cv.notify_all()
+            stopped = result.result(timeout=2)
+        self.assertEqual(stopped.state, 'stopped', stopped.error)
+        self.assertFalse(service.fifo.locked())
+        self.assertFalse(service.engine.ctl.locked())
+
+    def test_batch_foreign_control_lock_times_out_and_releases_only_fifo(self):
+        service, worker = self.batch_lane()
+        service.engine.ctl.acquire()
+        result = worker.persist_and_stop(self.store, timeout_s=0)
+        self.assertEqual(result.state, 'blocked')
+        self.assertFalse(service.fifo.locked())
+        self.assertTrue(service.engine.ctl.locked())
+        self.assertEqual(service.engine.inventory_calls, 0)
+        service.engine.ctl.release()
+
+    def test_batch_export_failure_keeps_process_and_releases_locks(self):
+        service, worker = self.batch_lane()
+        service.engine.fail_export = True
+        result = worker.persist_and_stop(self.store)
+        self.assertEqual(result.state, 'blocked')
+        self.assertTrue(service.engine.alive())
+        self.assertEqual(service.engine.close_count, 0)
+        self.assertFalse(service.fifo.locked())
+        self.assertFalse(service.engine.ctl.locked())
+
+    def test_batch_generation_or_process_swap_during_export_blocks_stop(self):
+        for change in ('generation', 'process'):
+            with self.subTest(change=change):
+                service, worker = self.batch_lane()
+                original = service.engine.session_export
+                def changed(*args):
+                    original(*args)
+                    if change == 'generation':
+                        service.engine.gen += 1
+                    else:
+                        service.engine.proc = Process()
+                service.engine.session_export = changed
+                result = worker.persist_and_stop(self.store)
+                self.assertEqual(result.state, 'blocked')
+                self.assertIn('process or generation changed', result.error)
+                self.assertEqual(service.engine.close_count, 0)
+                self.assertFalse(service.fifo.locked())
+                self.assertFalse(service.engine.ctl.locked())
+
+    def test_batch_close_cannot_retire_fixed_costs_of_restarted_engine(self):
+        service, worker = self.batch_lane()
+        original = service.engine.close
+        def restarted():
+            original()
+            service.engine.proc = Process()
+            service.engine.gen += 1
+        service.engine.close = restarted
+        result = worker.persist_and_stop(self.store)
+        self.assertEqual(result.state, 'blocked')
+        self.assertIn('restarted during lane shutdown', result.error)
+        self.assertEqual(service.request_admission.ledger.snapshot()['host_bytes'], 10)
+        self.assertFalse(service.fifo.locked())
+        self.assertFalse(service.engine.ctl.locked())
+
+    def test_batch_destination_restore_is_explicitly_rejected(self):
+        service, worker = self.batch_lane()
+        with self.assertRaisesRegex(ValueError, 'unbatched destination'):
+            worker.lazy_restore(self.store, 'unused', 'unused')
+        self.assertEqual(service.engine.restores, [])
+        self.assertFalse(service.fifo.locked())
+        self.assertFalse(service.engine.ctl.locked())
+
+    def test_batch_capability_or_group_mismatch_rejects_before_control(self):
+        for key, value in [('session_batch_export', False), ('slot_groups', 2)]:
+            service, _ = self.batch_lane()
+            setattr(service.engine, key, value)
+            with self.assertRaises(ValueError):
+                NativeLaneWorker(service, self.model, enabled=True)
+            self.assertEqual(service.engine.inventory_calls, 0)
 
 
 if __name__ == '__main__':

@@ -48,6 +48,23 @@ int main() {
     assert(cache.index_of(2) == 0);
     cache.clear();
     assert(inventory.collect(cache, true, false, 0, entries, error) && entries.empty());
+    // An idle cached slot is preserved even when the scheduler has no busy lease.
+    std::vector<SessionInventorySlot> slots{{0, 8, 1, false, true, false, false, false, true},
+                                          {1, 0, 0, false, false, false, false, false, true}};
+    assert(session_inventory_append_slots(slots, entries, error));
+    assert(entries.size() == 1 && entries[0].id == "slot-0" && entries[0].kind == "slot");
+    for (int mode = 0; mode < 7; ++mode) {
+        auto bad = slots;
+        if (mode == 0) bad[0].active = true;
+        if (mode == 1) bad[0].partial = true;
+        if (mode == 2) bad[0].tainted = true;
+        if (mode == 3) bad[0].images = true;
+        if (mode == 4) bad[0].cached = false;
+        if (mode == 5) bad[0].layout_valid = false;
+        if (mode == 6) bad[1].checkpoints = 1;
+        entries = {{"live", "live", 10}};
+        assert(!session_inventory_append_slots(bad, entries, error) && entries.empty());
+    }
     std::filesystem::remove(path);
     std::cout << "session inventory tests passed\n";
 }

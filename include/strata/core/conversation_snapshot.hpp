@@ -119,6 +119,14 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
                                                           SessionState& session, const ModelGeometry& g,
                                                           const QsaState& draft, std::string& error);
 
+// Disk streaming and read bounds also support target-only sessions (no learned draft).
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session,
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
+bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session,
+                                      const ModelGeometry& g, const QsaState* draft, uint64_t max_tokens,
+                                      uint64_t max_checkpoints, std::string& error);
+
 // The same with `draft == nullptr`: an image WITHOUT the draft layer's K/V (kv holds the session's own QSA layers
 // only).  A layer split's later stages park this way; the draft ring is saved once, with the first stage's image.
 // An image is validated and restored with the same kind of call it was saved with (a K/V layer count mismatch is

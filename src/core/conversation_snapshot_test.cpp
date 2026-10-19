@@ -174,6 +174,42 @@ void full_session(int fmt, int mode, int experts) {
               x.checkpoints.size()==y.checkpoints.size() && equal(x.kv[0],y.kv[0]) && equal(x.kv.back(),y.kv.back()),
               "streamed file equals captured file");
         check(slurp(p1)==slurp(p2),"streamed file is byte-identical to the captured file");
+        // Lifecycle batch export: source is an independent slot session, never mounted into main.
+        // No learned MTP is permitted in this mode. Stream and restore into another session with the
+        // same format; the slot's running and K/V bytes must remain identical throughout.
+        SavedConversation slot_before, slot_meta, slot_file, slot_after, target_after;
+        std::vector<SessionKvSource> slot_sources;
+        check(conversation_snapshot_save(slot_before,view,ss,g,nullptr,err),"target-only slot capture");
+        check(conversation_snapshot_sources(slot_meta,slot_sources,view,ss,g,nullptr,err),"target-only slot sources");
+        check(slot_sources.size()==slot_before.kv.size() && slot_sources.size()+1==b.kv.size(),
+              "no phantom draft source for slot");
+        Fixture target(fmt,mode); target.g=g;
+        SessionState target_ss;
+        target_ss.max_cells=ss.max_cells; target_ss.layer_hi=ss.layer_hi;
+        target_ss.gdn_alloc=ss.gdn_alloc; target_ss.qsa_alloc=ss.qsa_alloc;
+        target_ss.qsa_states=&target.state;
+        target.alloc(target_ss.gdn_state,sizes.gdn); target.alloc(target_ss.ple_hist,sizes.ple);
+        target.alloc(target.state.idx_tail,sizes.tail); target.alloc(target.state.idx_dead,sizes.dead);
+        target.alloc(target.state.idx_block_pos,sizes.block_pos);
+        SessionReadLimits slot_limits;
+        check(conversation_session_read_limits(slot_limits,target_ss,g,nullptr,96,16,err),
+              "target-only restore bounds");
+        check(slot_limits.max_kv_layers==slot_sources.size(),"restore bounds omit absent draft");
+        check(session_file_write(p1,slot_meta,slot_sources,id,n1,err),"stream target-only slot file");
+        check(session_file_read(p1,id,slot_file,n1,err,slot_limits),"read slot file with target-only bounds");
+        check(conversation_snapshot_restore(slot_file,target_ss,g,nullptr,err)==ConversationRestore::restored,
+              "restore slot file to independent unbatched session");
+        check(conversation_snapshot_save(target_after,view,target_ss,g,nullptr,err),"capture restored target");
+        check(conversation_snapshot_save(slot_after,view,ss,g,nullptr,err),"capture slot after export");
+        auto same_running=[](const SavedConversation& lhs,const SavedConversation& rhs) {
+            return lhs.live.ids==rhs.live.ids && lhs.live.gdn==rhs.live.gdn && lhs.live.ple==rhs.live.ple &&
+                lhs.live.tails==rhs.live.tails && lhs.live.dead==rhs.live.dead && lhs.live.block_pos==rhs.live.block_pos;
+        };
+        check(same_running(slot_before,target_after) && same_running(slot_before,slot_after),
+              "slot recurrent state preserved and independently restored");
+        for(size_t j=0;j<slot_before.kv.size();++j)
+            check(equal(slot_before.kv[j],target_after.kv[j]) && equal(slot_before.kv[j],slot_after.kv[j]),
+                  "slot KV preserved and independently restored");
         std::error_code ec;
         fs::remove_all(dir,ec);
         auto empty_ids=std::vector<int32_t>{};

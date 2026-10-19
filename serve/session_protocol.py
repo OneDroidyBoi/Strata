@@ -1,4 +1,4 @@
-"""Opt-in native inventory/export framing; the caller owns the service FIFO.
+"""Opt-in native inventory/export framing; the caller owns FIFO and batch ctl.
 
 Protocol failures block further checkpoint commands without killing the engine.
 The lifecycle owner keeps admission gated until an operator resolves the failure.
@@ -71,8 +71,13 @@ class SessionProtocol:
             for _ in range(count):
                 fields = self._read(deadline)
                 if (len(fields) != 4 or fields[0] != 'SESSION_ENTRY' or not _token(fields[1])
-                        or fields[1] in seen or fields[2] not in ('live', 'parked')):
+                        or fields[1] in seen or fields[2] not in ('live', 'parked', 'slot')):
                     raise SessionProtocolError('invalid or duplicate native session entry')
+                if fields[2] == 'slot':
+                    slot = re.fullmatch(r'slot-(0|[1-9][0-9]*)', fields[1])
+                    if (getattr(self.engine, 'session_batch_export', False) is not True or slot is None
+                            or int(slot[1]) >= getattr(self.engine, 'batch', 0)):
+                        raise SessionProtocolError('unadvertised or invalid native batch slot')
                 seen.add(fields[1])
                 sessions.append({'id': fields[1], 'kind': fields[2], 'tokens': _count(fields[3])})
             if self._read(deadline) != ['INVENTORY_END', generation]:

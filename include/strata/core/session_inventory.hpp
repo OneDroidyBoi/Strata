@@ -6,6 +6,26 @@
 #include <vector>
 namespace strata::core {
 struct SessionInventoryEntry { std::string id, kind; size_t tokens = 0; };
+// Every allocated slot is inspected, including ones the scheduler does not call busy.
+struct SessionInventorySlot {
+    size_t index = 0, tokens = 0, checkpoints = 0;
+    bool active = false, cached = false, partial = false, tainted = false, images = false;
+    bool layout_valid = true;
+};
+inline bool session_inventory_append_slots(const std::vector<SessionInventorySlot>& slots,
+                                          std::vector<SessionInventoryEntry>& entries, std::string& error) {
+    for (const auto& slot : slots) {
+        const bool empty = !slot.tokens && !slot.checkpoints;
+        if (slot.active || slot.partial || slot.tainted || slot.images || !slot.layout_valid ||
+            (!empty && (!slot.cached || !slot.tokens)) || (empty && slot.cached)) {
+            entries.clear(); error = "batch slot " + std::to_string(slot.index) +
+                " is active, partial, tainted, or cannot be exported completely"; return false;
+        }
+    }
+    for (const auto& slot : slots)
+        if (slot.tokens) entries.push_back({"slot-" + std::to_string(slot.index), "slot", slot.tokens});
+    return true;
+}
 class SessionInventory {
     std::string nonce_;
     uint64_t epoch_ = 0;

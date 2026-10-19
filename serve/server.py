@@ -2235,13 +2235,17 @@ class StrataEngine:
                 and self.precision_policy_report is not None
                 and self.precision_policy_report.get('enforced') is True)
 
+    @property
+    def session_batch_export(self):
+        return self.session_lifecycle and self.info.get('session_export_batch') in ('1', 1)
+
     def session_inventory(self):
-        """Enumerate all supported native state; caller holds FIFO and gates admission."""
+        """Enumerate state; caller gates admission and holds FIFO plus batch ctl."""
         from serve.session_protocol import SessionProtocol
         return SessionProtocol(self).inventory()
 
     def session_export(self, generation, session_id, path):
-        """Non-destructive export from an unchanged inventory; caller holds FIFO."""
+        """Export unchanged inventory; caller holds FIFO plus batch ctl after drain."""
         from serve.session_protocol import SessionProtocol
         return SessionProtocol(self).export(generation, session_id, str(path))
 
