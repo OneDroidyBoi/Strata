@@ -50,7 +50,7 @@ class BatchProtocolEngine:
             'enforced': True, 'draft': 'disabled',
             'artifact_audit': {'policy_passed': True,
                 'policy': {'minimum_bits': 4, 'preferred_bits': 8},
-                'components': {'target': {'files': [{'architecture': 'qwen4exp'}]}}},
+                'components': {'target': {'architecture': 'qwen4exp', 'files': [{'architecture': 'qwen4exp'}]}}},
             'pack_audit': {'packed_payload_verified_against_source': True}}
         self.entries = [{'id': 'live', 'kind': 'live', 'tokens': 0},
                         {'id': 'slot-0', 'kind': 'slot', 'tokens': 80},

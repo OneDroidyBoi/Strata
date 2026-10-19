@@ -87,8 +87,15 @@ class NativeLaneWorker:
                 or type(preferred) is not int or preferred < 8 or preferred < floor
                 or report.get('pack_audit', {}).get('packed_payload_verified_against_source') is not True):
             raise ValueError('native lane requires verified Q4 minimum / Q8 preferred artifacts and pack')
-        files = audit.get('components', {}).get('target', {}).get('files', [])
-        if not files or any(f.get('architecture') != self.model.architecture for f in files):
+        # GGUF split writers may put model metadata only in the first shard.
+        # The audit validates the complete shard set and aggregates explicit values.
+        target = audit.get('components', {}).get('target', {})
+        files = target.get('files') if isinstance(target, dict) else None
+        if (not isinstance(target, dict) or target.get('architecture') != self.model.architecture
+                or not isinstance(files, list) or not files
+                or any(not isinstance(f, dict) or f.get('architecture') not in (None, self.model.architecture)
+                       for f in files)
+                or not any(f.get('architecture') == self.model.architecture for f in files)):
             raise ValueError('audited target architecture does not match lane identity')
         for method in ('session_inventory', 'session_export', 'session_file', 'close', 'alive'):
             if not callable(getattr(self.engine, method, None)):

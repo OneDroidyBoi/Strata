@@ -42,7 +42,7 @@ class Engine:
             'enforced': True, 'draft': 'disabled',
             'artifact_audit': {'policy_passed': True,
                 'policy': {'minimum_bits': 4, 'preferred_bits': 8},
-                'components': {'target': {'files': [{'architecture': 'qwen4exp'}]}}},
+                'components': {'target': {'architecture': 'qwen4exp', 'files': [{'architecture': 'qwen4exp'}]}}},
             'pack_audit': {'packed_payload_verified_against_source': True}}
         self.generation = 'process1-epoch2'
         self.entries = [{'id': 'live', 'kind': 'live', 'tokens': 3},
@@ -144,6 +144,49 @@ class NativeLaneTests(unittest.TestCase):
         self.engine = Engine(self.model, self.service.fifo)
         self.service.engine = self.engine
         self.worker = NativeLaneWorker(self.service, self.model, enabled=True)
+
+    def shard_audit(self, architectures):
+        from tools.model_manifest import build_manifest
+        from tools.test_model_manifest import fixture
+        paths = []
+        for index, architecture in enumerate(architectures):
+            path = Path(self.tmp.name) / f'model-{index + 1:05d}-of-00004.gguf'
+            metadata = [('general.architecture', 8, architecture)] if architecture is not None else []
+            paths.append(fixture(path, [(f'weight.{index}', [32], 8, 0, 34)], metadata))
+        return build_manifest({'target': paths}, content_hash=True)
+
+    def test_real_split_audit_with_metadata_only_in_first_shard(self):
+        audit = self.shard_audit(['qwen4exp', None, None, None])
+        self.assertTrue(audit['policy_passed'])
+        target = audit['components']['target']
+        self.assertEqual(target['architecture'], 'qwen4exp')
+        self.assertEqual([f['architecture'] for f in target['files']], ['qwen4exp', None, None, None])
+        self.engine.precision_policy_report['artifact_audit'] = audit
+        NativeLaneWorker(self.service, self.model, enabled=True)
+        self.assertEqual(self.engine.inventory_calls, 0)
+        self.assertEqual(self.engine.close_count, 0)
+
+    def test_real_split_audit_rejects_conflicts_absent_metadata_and_missing_shards(self):
+        for architectures in (['qwen4exp', 'other', None, None], [None] * 4,
+                              ['qwen4exp', None, None]):
+            with self.subTest(architectures=architectures):
+                self.engine.precision_policy_report['artifact_audit'] = self.shard_audit(architectures)
+                with self.assertRaises(ValueError):
+                    NativeLaneWorker(self.service, self.model, enabled=True)
+        self.assertEqual(self.engine.inventory_calls, 0)
+        self.assertEqual(self.engine.close_count, 0)
+
+    def test_shard_architecture_report_requires_consistent_aggregate_and_explicit_value(self):
+        audit = self.shard_audit(['qwen4exp', None, None, None])
+        for change in ({'architecture': None}, {'architecture': 'other'}, {'files': []},
+                       {'files': [None]}, {'files': [{'architecture': None}] * 4},
+                       {'files': [{'architecture': 'qwen4exp'}, {'architecture': 'other'}]}):
+            with self.subTest(change=change):
+                bad = deepcopy(audit)
+                bad['components']['target'].update(change)
+                self.engine.precision_policy_report['artifact_audit'] = bad
+                with self.assertRaisesRegex(ValueError, 'architecture'):
+                    NativeLaneWorker(self.service, self.model, enabled=True)
 
     def test_full_inventory_published_before_confirmed_stop(self):
         original = deepcopy(self.engine.entries)

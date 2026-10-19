@@ -58,6 +58,21 @@ the lightweight interpreter; those conversion tests were separately run with
 NumPy. The CI environment now installs NumPy to run them. No GPU qualification
 or live 195-tensor audit was performed in the implementation checkout.
 
+### Split-GGUF lane identity correction
+
+A further Python-only correction admits an audited target shard set whose
+`components.target.architecture` matches the lane and whose explicit per-file
+architecture values all agree. Secondary shards may omit architecture metadata;
+at least one shard must explicitly name the matching architecture. The existing
+complete-shard and precision audit must still pass. This fixes the previous
+requirement that every shard repeat `general.architecture`.
+
+Regression coverage constructs real four-shard GGUF audit reports, including
+first-shard-only metadata, conflicting values, absent metadata and incomplete
+shard sets. Lane/checkpoint/restore/migration/manifest and control/protocol tests:
+165 passed locally. Record this Python overlay separately from the unchanged C++
+binary; it does not establish GPU continuation or migration success.
+
 ## Isolation and precision gates
 
 1. Inventory GPU UUIDs, processes, reserved devices, free VRAM, host RAM and disk
