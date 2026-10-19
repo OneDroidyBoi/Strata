@@ -296,6 +296,10 @@ public:
             if (serials_[i] == serial) return i;
         return SIZE_MAX;
     }
+    // Read-only enumeration; pointers remain valid until the cache changes.
+    template<class Visitor> void visit(Visitor&& visitor) const {
+        for (size_t i = 0; i < entries_.size(); ++i) visitor(serials_[i], entries_[i]);
+    }
     const SavedConversation* find(uint64_t serial) const {
         const size_t i = index_of(serial);
         return i == SIZE_MAX ? nullptr : &entries_[i];

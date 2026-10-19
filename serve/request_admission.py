@@ -1,5 +1,54 @@
 """Opt-in request reservations using explicit, operator-calibrated peak costs."""
+import threading
+
 from serve.resource_admission import AdmissionRejected, ResourceLedger
+
+
+class _DrainReservation:
+    """Retain one lease through asynchronous exact-request drain callbacks."""
+    def __init__(self, controller, lease, receipt):
+        self.controller, self.lease, self.receipt = controller, lease, receipt
+        self.lock = threading.RLock()
+        self.closed = False
+        self.released = False
+        receipt.add_done_callback(self.changed)
+
+    def changed(self, receipt):
+        # A late or duplicate callback can never release another request's lease.
+        if receipt is not self.receipt:
+            return
+        with self.lock:
+            try:
+                failed = receipt.failed() is True
+                confirmed = not self.released and receipt.confirmed() is True
+            except Exception:
+                self.controller.gate_admission()
+                return
+            if failed:
+                self.controller.gate_admission()
+            # Failure can race the confirmation read: its later callback must
+            # still gate the lane even after this reservation was released.
+            if self.released:
+                return
+            if self.closed and confirmed:
+                self.controller.ledger.release(
+                    self.lease, iterator_closed=True, work_drained=True)
+                self.released = True
+
+    def finish(self, failed):
+        if failed:
+            self.controller.gate_admission()
+            self.receipt.mark_failed()
+        with self.lock:
+            self.closed = True
+        # seal is after the inner iterator's close, so no continuation can
+        # register native work after the reservation is released.
+        try:
+            self.receipt.seal()
+        except Exception:
+            self.controller.gate_admission()
+            return
+        self.changed(self.receipt)
 
 
 class RequestAdmission:
@@ -39,8 +88,15 @@ class RequestAdmission:
             self.worker, host_bytes=c['host_request_bytes'] + tokens * c['host_bytes_per_token'],
             gpu_bytes=c['gpu_request_bytes'] + tokens * c['gpu_bytes_per_token'], context_tokens=tokens)
 
-    def run(self, factory, prompt_tokens, max_new, quiescent):
+    def run(self, factory, prompt_tokens, max_new, quiescent=None, *, drain_receipt=None):
         lease = self.acquire(prompt_tokens, max_new)
+        pending = None
+        if drain_receipt is not None:
+            try:
+                pending = _DrainReservation(self, lease, drain_receipt)
+            except Exception:
+                self.gate_admission()
+                raise
         iterator = None
         close_ok = False
         failed = False
@@ -61,15 +117,21 @@ class RequestAdmission:
                     iterator.close()
                 close_ok = True
             finally:
-                try:
-                    drained = close_ok and not failed and quiescent() is True
-                except Exception:
-                    drained = False
-                if drained:
-                    self.ledger.release(lease, iterator_closed=True, work_drained=True)
+                if pending is not None:
+                    try:
+                        pending.finish(failed or not close_ok)
+                    except Exception:
+                        self.gate_admission()
                 else:
-                    # Never reuse uncertain capacity after an incomplete cancellation drain.
-                    self.gate_admission()
+                    try:
+                        drained = close_ok and not failed and quiescent() is True
+                    except Exception:
+                        drained = False
+                    if drained:
+                        self.ledger.release(lease, iterator_closed=True, work_drained=True)
+                    else:
+                        # Never reuse uncertain capacity after incomplete drain.
+                        self.gate_admission()
 
     def gate_admission(self):
         self.ledger.begin_drain(self.worker)

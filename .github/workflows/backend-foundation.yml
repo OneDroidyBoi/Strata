@@ -3,6 +3,10 @@ on:
   push:
     paths:
       - 'serve/**'
+      - 'include/strata/core/**'
+      - 'src/core/**'
+      - 'src/program/generate.cpp'
+      - 'CMakeLists.txt'
       - 'tools/*manifest*.py'
       - 'tools/*backend_preflight.py'
       - 'tools/gguf_reader.py'
@@ -10,6 +14,10 @@ on:
   pull_request:
     paths:
       - 'serve/**'
+      - 'include/strata/core/**'
+      - 'src/core/**'
+      - 'src/program/generate.cpp'
+      - 'CMakeLists.txt'
       - 'tools/*manifest*.py'
       - 'tools/*backend_preflight.py'
       - 'tools/gguf_reader.py'
@@ -31,5 +39,14 @@ jobs:
         run: |
           python -m pip install jinja2==3.1.6 pytest==8.4.2
           python -m pytest -q tools/test_model_manifest.py serve/test_backends.py tools/test_backend_preflight.py serve/test_precision_policy.py serve/test_runtime_precision.py serve/test_resource_admission.py serve/test_request_admission.py serve/test_lane_lifecycle.py
+          python -m pytest -q serve/test_slot_drain.py serve/test_session_protocol.py serve/test_native_lane.py serve/test_native_lane_controls.py
       - name: Check existing serving behavior with local fake engines
         run: python -m pytest -q serve/test_quiet_cancel.py serve/test_request_accounting.py serve/test_replicas.py serve/test_lifecycle.py
+      - name: Validate native CPU session persistence
+        run: |
+          c++ -std=c++20 -Wall -Wextra -Werror -Iinclude src/core/session_inventory_test.cpp src/core/conversation_file.cpp -o /tmp/strata-session-inventory-test
+          /tmp/strata-session-inventory-test
+          c++ -std=c++20 -Wall -Wextra -Werror -Iinclude src/core/conversation_cache_test.cpp -o /tmp/strata-conversation-cache-test
+          /tmp/strata-conversation-cache-test
+          c++ -std=c++20 -Wall -Wextra -Werror -Iinclude src/core/conversation_file_test.cpp src/core/conversation_file.cpp -o /tmp/strata-conversation-file-test
+          /tmp/strata-conversation-file-test

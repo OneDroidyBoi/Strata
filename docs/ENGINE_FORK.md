@@ -18,7 +18,8 @@ branch, not a replacement for an installed Strata server.
 - Enforces an optional precision policy before native construction and restart,
   and explicit resource reservations around the supported request path.
 - Adds durable checkpoint storage and an injected-worker persist-and-stop
-  lifecycle; native all-session export remains a separate implementation gate.
+  lifecycle, plus a native live/parked-session mapping for the supported unbatched
+  layout. Batch-slot export and GPU qualification remain separate gates.
 
 The backend adapter, launch precision policy, resource ledger and checkpoint
 controller are separate opt-in components. None changes numerical kernels or
@@ -205,12 +206,17 @@ closes its iterator and calls the supplied quiescence check before release; an
 uncertain drain or execution exception retains the reservation and gates further
 admission. Recovery requires explicit inspection; capacity is never silently reused.
 
-This first integration is **one GPU, one lane, text-only, unbatched execution**.
-Vision/images, replicas and native batching are rejected. Native batching can
-return before its background BDONE drain completes; supporting it requires a
-per-request completion acknowledgement tied to the reservation. The ledger can
-already account for concurrent workers, but this server hook does not yet qualify
-batched concurrency. It is a conservative rejection gate,
+This integration is **one GPU, one lane, text-only**, with native batched
+admission enabled through per-request drain receipts. Vision/images and replicas
+remain rejected. Each receipt follows the captured process generation and slot
+through all internal request legs. Iterator closure seals the receipt; the
+reservation stays charged until every leg has its terminal acknowledgement or
+the captured process has actually exited. EOF, an unrelated slot's BDONE and a
+replacement process do not prove completion. Pending cancellations keep their
+slots unavailable; failed or timed-out drains gate further admission. Other
+requests can continue within the remaining budget while a valid drain is pending.
+The native protocol has no request nonce: exclusivity of the captured slot queue
+and withholding slot reuse are part of this proof. It is a conservative rejection gate,
 not a GPU scheduler, a cross-process shared-memory broker or proof of physical
 fit. Holding a reservation until an HTTP iterator closes is insufficient if the
 engine still drains a batch slot in the background; native quiescence must be
@@ -266,32 +272,55 @@ restore can have mutated state: `blocked` is not permission to resume serving or
 retry blindly. After a successful stop, construct a new lifecycle around the new
 ready worker rather than pretending the old process has restarted.
 
-### Native checkpoint gap and next step
+### Native inventory, export and shutdown
 
-These are real disk/lifecycle components with injected-worker tests, **not an
-implemented native all-session migration adapter**. `StrataEngine.session_file`
-implements SAVE/RESTORE for the current conversation between requests while the
-caller holds the service FIFO. It does not enumerate/export every live, idle-slot
-and parked conversation. The backend adapter's durable-checkpoint and migration
-capabilities therefore remain false.
+The opt-in native implementation uses `STRATA_SESSION_EXPORT=1` and advertises
+`INFO session_export=1`. `INVENTORY` returns a process/epoch generation and every
+live or parked session in the supported layout. `EXPORT <generation> <id> <path>`
+rejects stale generations and writes that exact session without evicting others.
+Live export retains every checkpoint and disables SAVE's optional reclamation;
+parked export reads its existing host image directly. Ordinary commands invalidate
+the inventory generation. No transcript or token text appears in the inventory.
 
-The next native work must begin with an exact inventory API under the same
-admission gate and executor owner. Give each retained conversation a stable ID
-and list its target KV, recurrent/conv state, indexer state, PLE predecessor/history,
-sampling/RNG, checkpoint boundaries and any enabled draft state. Prove that no
-slot or parked branch is omitted. Then implement non-destructive export of each
-selected session using the existing native file machinery where its coverage is
-adequate. Export must leave other sessions intact and must include compatible
-model/layout/precision identities. A deliberately restricted one-conversation
-adapter is valid only when it enforces that there are no other retained sessions;
-it must not advertise general multi-session migration.
+This first native checkpoint layout is **single-GPU, unbatched qwen4exp with
+prompt caching enabled and learned MTP disabled**. Batch slots, layer splits,
+peer GPUs, incomplete live state and unsupported parked state reject the whole
+inventory. Batched admission support does not imply batched checkpoint support.
+Native CPU tests round-trip stored KV/recurrent/PLE/tail state; the GPU capture
+and restore paths have not yet been built or qualified on CUDA, HIP or SYCL here.
+The generic backend capability flags remain false pending that qualification.
 
-Once that mapping is tested, graceful shutdown can gate new work, drain, check
-available disk space, persist every session, confirm durable publication and stop
-the process. Only after confirmed exit should the resource ledger remove fixed
-resident charges. On checkpoint failure, leave the lane gated and avoid teardown;
-on restore, load a compatible lane and restore sessions lazily as their owners
-return. Transcript replay is a cold reconstruction path, not warm state migration.
+`NativeLaneWorker(service, model, enabled=True)` connects the implementation to
+the durable lifecycle. It requires an enforced Q4-minimum/Q8-preferred source and
+pack audit, a matching `engine.model_identity`, and the service's actual admission
+controller. The owner supplies an immutable complete weight/configuration and
+tokenizer identity after audit and READY; metadata alone cannot attest identity.
+
+```python
+from serve.native_lane import NativeLaneWorker
+from serve.checkpoint_store import CheckpointStore
+
+# A ready audited engine, calibrated admission controller, and owner-verified
+# ModelIdentity must already exist. The store directory must already be durable.
+service.engine.model_identity = model_identity
+worker = NativeLaneWorker(service, model_identity, enabled=True)
+result = worker.persist_and_stop(CheckpointStore(checkpoint_directory), timeout_s=30)
+# Only result.state == "stopped" confirms publication and process exit.
+```
+
+The worker gates requests, drains leases, holds the service FIFO, exports all
+sessions, rechecks the generation, publishes the bundle and confirms process exit
+before retiring fixed memory charges. Ordinary load/unload, slot-file and VRAM
+controls are gated too. Failed export or protocol framing leaves the lane gated;
+protocol failure does not kill the engine or permit a legacy restore retry.
+
+Restoration uses a new ready compatible worker and its `lazy_restore` operation,
+selecting an ID from the published bundle. Admission remains gated until its owner
+reconciles restored state and registers valid resource ownership. This is a Python
+owner API, not an automatic signal handler, HTTP session router or 3-to-1 lane
+migration controller. Mapping agent identities to saved sessions and batch-slot
+state serialization remain separate work. Checkpoints preserve reusable context
+between requests; they do not promise resumption midway through a sampled reply.
 
 ## Validation
 
@@ -300,6 +329,7 @@ From the repository root, run the CPU-only suites relevant to these components:
 ```sh
 python -m pip install jinja2==3.1.6 pytest==8.4.2
 python -m pytest -q tools/test_model_manifest.py serve/test_backends.py tools/test_backend_preflight.py serve/test_precision_policy.py serve/test_runtime_precision.py serve/test_resource_admission.py serve/test_request_admission.py serve/test_lane_lifecycle.py
+python -m pytest -q serve/test_slot_drain.py serve/test_session_protocol.py serve/test_native_lane.py serve/test_native_lane_controls.py
 python -m pytest -q serve/test_quiet_cancel.py serve/test_request_accounting.py serve/test_replicas.py serve/test_lifecycle.py
 ```
 
@@ -315,11 +345,11 @@ SM70 compatibility, Q8 fit or performance. No GPU backend build is implied.
 
 1. Qualify the opt-in runtime hooks using actual launch and request inputs; keep
    unsupported modes rejected and expose effective policies in status.
-2. Calibrate reservation estimates and retain them through confirmed native drain;
-   then extend beyond the initial single-lane text-only scope deliberately.
+2. Qualify per-slot drain receipts on an isolated runner lane and calibrate peak
+   reservations before extending beyond the single-lane text-only scope.
 3. Harden shared expert-store publication/attach semantics with immutable identity.
-4. Add exact native session inventory, per-session export and compatible restore,
-   then connect durable graceful shutdown to resource retirement.
+4. Build every affected GPU backend and qualify native export/restore; then add
+   batch-slot state serialization and agent-to-checkpoint ownership routing.
 5. Qualify another architecture and, with the benchmark runner, useful deep-context
    concurrency and lane-count transitions. A generic metadata type is not support
    for another model's executor or state format.

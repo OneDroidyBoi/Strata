@@ -1305,6 +1305,7 @@ class StrataEngine:
                 self._last_done = line
             elif line.startswith("BADM "):
                 f = line.split()
+                self._ctl_result_slot = f[1] if len(f) == 3 and f[2] in ('0', '1') else None
                 self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
                 return
             elif line.startswith("YIELDED "):            # the read gave way (BYIELD): <slot> <tokens read>
@@ -1370,45 +1371,114 @@ class StrataEngine:
                 return line
         return None
 
-    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
+    @contextlib.contextmanager
+    def track_drain(self, receipt):
+        """Opt-in receipt scope across all internal generation continuations."""
+        local = self.__dict__.setdefault('_drain_local', threading.local())
+        previous = getattr(local, 'receipt', None)
+        local.receipt = receipt
+        try:
+            yield receipt
+        finally:
+            local.receipt = previous
+
+    SLOT_DRAIN_TIMEOUT_S = 600.0
+
+    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None,
+                                *, receipt=None, ticket=None, process=None, generation=None):
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
+        def stale_generation():
+            return self.gen != generation or self.proc is not process
+
+        def abandon_stale():
+            receipt.mark_failed()
+            receipt.confirm_process_exit(ticket)
+
+        if receipt is not None and stale_generation():
+            abandon_stale()
+            return  # never inspect, consume, or modify a successor's slot queues
         if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
+            if receipt is not None:
+                receipt.mark_failed()
             return
-        try:
-            self._send(f"BSTOP {slot}")
-        except EngineDied:
-            pass
-        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
-        releasing = self.slot_releasing
+        if receipt is not None:
+            from serve.drain_receipt import matching_bdone
+            q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held
+            releasing, cv, write_lock = self.slot_releasing, self.slot_cv, self.wlock
+            if stale_generation():
+                abandon_stale()
+                return
+            try:
+                with write_lock:
+                    if stale_generation():
+                        abandon_stale()
+                        return
+                    # Restart can replace self.proc immediately after this check.
+                    # The write must still target the captured old process only.
+                    process.stdin.write(f"BSTOP {slot}\n")
+                    process.stdin.flush()
+            except (OSError, AttributeError, ValueError):
+                receipt.mark_failed()  # still wait for its terminal record/exit
+        else:
+            try:
+                self._send(f"BSTOP {slot}")
+            except EngineDied:
+                pass
+            q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held
+            releasing, cv = self.slot_releasing, self.slot_cv
         releasing.add(slot)
 
         def wait():
-            end = time.monotonic() + 600.0
+            end = time.monotonic() + self.SLOT_DRAIN_TIMEOUT_S
             tail = list(stream or [])
-            while time.monotonic() < end:
+            warned = False
+            while receipt is not None or time.monotonic() < end:
+                if receipt is not None:
+                    try:
+                        exited = process is not None and process.poll() is not None
+                    except Exception:
+                        receipt.mark_failed()
+                        exited = False
+                    if exited:
+                        receipt.confirm_process_exit(ticket)
+                        tail = []
+                        break
+                    if time.monotonic() >= end and not warned:
+                        receipt.mark_failed()
+                        warned = True
                 try:
-                    line = q.get(timeout=5.0)
+                    line = q.get(timeout=0.25 if receipt is not None else 5.0)
                 except queue.Empty:
                     continue
                 if line is None:
                     tail = []
-                    break
+                    if receipt is None:
+                        break
+                    receipt.mark_failed()  # EOF alone is not confirmed process exit.
+                    continue
                 if line.startswith("BT "):
                     try:
                         tail.append(int(line.split()[2]))
                     except (IndexError, ValueError):
                         tail = []
                 if line.startswith("BDONE "):
+                    if receipt is not None:
+                        if not matching_bdone(line, slot):
+                            receipt.mark_failed()
+                            continue
+                        if not receipt.acknowledge(ticket, generation, slot):
+                            receipt.mark_failed()
+                            continue
                     if line.split()[3:4] == ["nonfinite"]:   # #879: the engine dropped the slot's state
                         tail = []
                     break
             held[slot] = tail[:-1] if stream and tail else []
-            with self.slot_cv:
+            with cv:
                 busy[slot] = False
                 releasing.discard(slot)
-                self.slot_cv.notify_all()
+                cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
 
     BGEN_REFUSALS_MAX = 6    # #1994: how often one request tries another slot after the engine refused a BGEN
@@ -1562,6 +1632,20 @@ class StrataEngine:
         if not ok:
             return
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
+        receipt = getattr(getattr(self, '_drain_local', None), 'receipt', None)
+        if receipt is not None:
+            from serve.drain_receipt import matching_bdone
+        drain_process, drain_generation = getattr(self, 'proc', None), self.gen
+        ticket = receipt.begin(drain_generation, drain_process) if receipt is not None else None
+        drain_safe, drain_slot = True, None
+
+        def drain_start(selected_slot):
+            nonlocal drain_safe, drain_slot
+            if receipt is not None:
+                if self.gen != drain_generation:
+                    raise EngineDied('engine generation changed during tracked request')
+                receipt.expect_slot(ticket, selected_slot)
+            drain_safe, drain_slot = False, selected_slot
         btrace("ctl acquired")
         slot, gen0, reserved = None, None, None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
@@ -1580,6 +1664,7 @@ class StrataEngine:
                 if alone and left > 1:
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
+                    drain_start(None)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
@@ -1608,6 +1693,7 @@ class StrataEngine:
                             give_way()
                             yield None
                     phase = "none"                          # its DONE is read
+                    drain_safe = getattr(self, '_last_done', None) is not None
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
@@ -1695,10 +1781,12 @@ class StrataEngine:
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live
                     self._last_done = None                  # (#879: this admission's DONE decides below)
+                    drain_start(slot)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
+                    self._ctl_result_slot = None
                     self._ctl_erred = False
                     asked = False
 
@@ -1737,6 +1825,11 @@ class StrataEngine:
                         slot = None
                         continue
                     cont = bool(self._ctl_result and self._ctl_result[1])
+                    drain_safe = bool(self._ctl_result and not cont)
+                    if receipt is not None and self._ctl_result_slot != str(slot):
+                        drain_safe = False
+                        phase = 'none'
+                        raise EngineDied('batch admission acknowledged another or invalid slot')
                     phase = "slot" if cont else "none"
                     while pending:
                         t = pending.pop(0)
@@ -1754,9 +1847,10 @@ class StrataEngine:
                 live.update(state="decoding", first_token=time.time(), generated=len(out))
                 gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
                 going_solo = False
+                tracked_slot_queue = self.slot_q[slot] if receipt is not None else None
                 while True:
                     try:
-                        line = self.slot_q[slot].get(timeout=10.0)
+                        line = (tracked_slot_queue if receipt is not None else self.slot_q[slot]).get(timeout=10.0)
                     except queue.Empty:
                         if cancel.is_set() and not stop_sent:
                             self._send(f"BSTOP {slot}")
@@ -1781,6 +1875,10 @@ class StrataEngine:
                             self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
                             going_solo = True
                     elif line.startswith("BDONE "):
+                        if receipt is not None and not matching_bdone(line, slot):
+                            receipt.mark_failed()
+                            continue
+                        drain_safe = True
                         phase = "none"
                         f = line.split()
                         self._apply_bdone(f)
@@ -1818,19 +1916,27 @@ class StrataEngine:
                     phase = "none"                      # #1059: it ended on the engine's ERR: no DONE to wait 300 s for
                 if phase == "solo":
                     self._send("STOP")
-                    self._drain_control("DONE", born=born)
+                    line = self._drain_control("DONE", born=born)
+                    drain_safe = bool(line and line.startswith('DONE '))
                 elif phase == "admit":
                     line = self._drain_control("BADM", born=born)
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
+                    elif (line and line.startswith('BADM ') and line.split()[2:3] == ['0']
+                          and (receipt is None or line.split()[1:2] == [str(slot)])):
+                        drain_safe = True
             except EngineDied:
                 pass
             bdone_in = False
             if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
                 bd = self._bdone_after_eos(slot)            # (#1869) the slot's figures, not the admission's
+                if receipt is not None and bd is not None and not matching_bdone(bd, slot):
+                    receipt.mark_failed()
+                    bd = None
                 if bd is not None:
                     self._apply_bdone(bd.split())
                     bdone_in = True
+                    drain_safe = True
             if reused0 is not None and isinstance(self.last, dict):
                 self.last = {**self.last, "reused": reused0}
             if carry and isinstance(self.last, dict):
@@ -1840,9 +1946,15 @@ class StrataEngine:
             if admit_wait:
                 with self.slot_cv:
                     self.admitting = max(0, self.admitting - 1)
+            if receipt is not None and self.gen != drain_generation:
+                slot, reserved = None, None  # never clear a successor's flags
+                receipt.confirm_process_exit(ticket)
             if reserved is not None:
                 with self.slot_cv:
-                    self.slot_busy[reserved] = False
+                    if receipt is not None and not drain_safe:
+                        self.slot_releasing.add(reserved)
+                    else:
+                        self.slot_busy[reserved] = False
                     self.slot_claims.discard(reserved)
                     self.slot_cv.notify_all()
             if slot is not None:
@@ -1858,13 +1970,26 @@ class StrataEngine:
                 elif phase == "slot":
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream)    # freed at its BDONE
+                    if receipt is None:
+                        self._release_slot_when_done(slot, stream)
+                    else:
+                        self._release_slot_when_done(slot, stream, receipt=receipt, ticket=ticket,
+                                                     process=drain_process, generation=drain_generation)
                     self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
                     with self.slot_cv:
-                        self.slot_busy[slot] = False
+                        if receipt is not None and not drain_safe:
+                            self.slot_releasing.add(slot)  # uncertain admission is not an orphan
+                        else:
+                            self.slot_busy[slot] = False
                         self.slot_claims.discard(slot)
                         self.slot_cv.notify_all()
+            if receipt is not None:
+                if drain_safe:
+                    receipt.acknowledge(ticket, drain_generation, drain_slot)
+                elif phase != 'slot':
+                    receipt.mark_failed()
+                    receipt.confirm_process_exit(ticket)
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
@@ -2104,6 +2229,22 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
+    @property
+    def session_lifecycle(self):
+        return (self.info.get('session_export') in ('1', 1)
+                and self.precision_policy_report is not None
+                and self.precision_policy_report.get('enforced') is True)
+
+    def session_inventory(self):
+        """Enumerate all supported native state; caller holds FIFO and gates admission."""
+        from serve.session_protocol import SessionProtocol
+        return SessionProtocol(self).inventory()
+
+    def session_export(self, generation, session_id, path):
+        """Non-destructive export from an unchanged inventory; caller holds FIFO."""
+        from serve.session_protocol import SessionProtocol
+        return SessionProtocol(self).export(generation, session_id, str(path))
+
     def session_file(self, action: str, path: str) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
@@ -2116,6 +2257,8 @@ class StrataEngine:
         a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
         that never ends is still ended."""
+        if getattr(self, '_session_protocol_failed', False):
+            raise EngineDied('native session protocol is blocked; no further session commands are safe')
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
         try:
@@ -3218,6 +3361,8 @@ class Service:
         def error(code, message):
             return code, {"error": {"code": code, "message": message,
                                     "type": "invalid_request_error" if code < 500 else "server_error"}}
+        if getattr(self, 'native_lane_gated', False):
+            return error(503, 'native lane lifecycle owns session controls')
         if not self.slot_save_path or not hasattr(self.engine, "session_file"):
             return error(501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")
         if getattr(self.engine, "batch", 0):
@@ -3246,6 +3391,8 @@ class Service:
                 with self.status_lock:
                     self.status["queued"] -= 1
                 waiting = False
+                if getattr(self, 'native_lane_gated', False):
+                    return error(503, 'native lane lifecycle owns session controls')
                 if not self.loaded():
                     return error(503, "the model is not loaded")
                 with self.status_lock:
@@ -3419,6 +3566,8 @@ class Service:
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
+        if getattr(self, 'native_lane_gated', False):
+            raise GpuBusy('native lane lifecycle is gated; explicit owner recovery is required', retry_after=15)
         hook_failed = None
         if self.before_load:
             cmd = self.before_load
@@ -3508,6 +3657,8 @@ class Service:
         An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}."""
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
+        if getattr(self, 'native_lane_gated', False):
+            raise ModelBusy('native lane lifecycle owns resource controls')
         if not self.fifo.acquire(timeout=self.vram_wait_s):
             raise ModelBusy("a request is still running; try again when it has finished")
         # parallel requests do not hold the fifo: the engine's control lines (a prompt being admitted) are taken too,
@@ -3517,6 +3668,8 @@ class Service:
             self.fifo.release()
             raise ModelBusy("a request is still running; try again when it has finished")
         try:
+            if getattr(self, 'native_lane_gated', False):
+                raise ModelBusy('native lane lifecycle owns resource controls')
             if not self.loaded():
                 self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
                 return {"status": "not loaded", "reserve_mib": reserve_mib,
@@ -3541,6 +3694,8 @@ class Service:
 
     def load(self):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
+        if getattr(self, 'native_lane_gated', False):
+            raise GpuBusy('native lane lifecycle is gated; explicit owner recovery is required', retry_after=15)
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
         if self.loaded() and not self._vision_down():
@@ -3592,6 +3747,8 @@ class Service:
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
+            if getattr(self, 'native_lane_gated', False):
+                return 'busy'
             if not self.engine.alive():
                 return "not loaded"
             with self.status_lock:
@@ -4201,10 +4358,18 @@ class Service:
                     return self.engine.alive() or (proc is not None and proc.poll() is not None)
                 try:
                     if getattr(self.engine, 'batch', 0):
-                        raise AdmissionRejected('batched admission needs per-slot drain acknowledgements')
-                    yield from admission.run(
-                        lambda: self._run(ids, thinking, tools, max_new, sampling, cancel, force),
-                        len(ids), max_new, drained)
+                        if not isinstance(self.engine, StrataEngine):
+                            raise AdmissionRejected('this batched backend does not provide drain receipts')
+                        from serve.drain_receipt import DrainReceipt
+                        receipt = DrainReceipt()
+                        def tracked():
+                            with self.engine.track_drain(receipt):
+                                yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force)
+                        yield from admission.run(tracked, len(ids), max_new, drain_receipt=receipt)
+                    else:
+                        yield from admission.run(
+                            lambda: self._run(ids, thinking, tools, max_new, sampling, cancel, force),
+                            len(ids), max_new, drained)
                 except AdmissionRejected as exc:
                     raise EngineDied(f'resource admission rejected this request: {exc}') from exc
         finally:
@@ -6882,9 +7047,6 @@ def main() -> int:
     from serve.request_admission import configured_admission
     try:
         admission = configured_admission(cfg, gpu_list(cfg)) if 'resource_admission' in cfg else None
-        if admission is not None and any(
-                arg == '--batch' or arg.startswith('--batch=') for arg in engine_args(cfg)):
-            raise ValueError('resource_admission does not yet support batched native drain')
     except (ValueError, RuntimeError) as exc:
         ap.error(str(exc))
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can

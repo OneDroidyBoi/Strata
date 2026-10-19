@@ -25,6 +25,8 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
+#include "strata/core/session_inventory.hpp"
+#include <random>
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
@@ -10436,6 +10438,17 @@ int main(int argc, char** argv) {
                                  (long long) (later_reserve + 768 - sf_mib));
             }
         }
+        const bool session_export_enabled = [] {
+            const char* value = std::getenv("STRATA_SESSION_EXPORT");
+            return value && std::string(value) == "1";
+        }();
+        // A fresh random process nonce prevents stale IDs crossing engine restarts.
+        strata::core::SessionInventory session_inventory(session_export_enabled ? [] {
+            std::random_device random;
+            std::string nonce;
+            for (int i = 0; i < 4; ++i) nonce += std::to_string(random()) + "-";
+            return nonce;
+        }() : "disabled");
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
             size_t free_b = 0, total_b = 0;
@@ -10462,7 +10475,7 @@ int main(int argc, char** argv) {
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
                         "tail_role_token=%lld vram_elastic=%d "
-                        "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
+                        "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -10482,7 +10495,8 @@ int main(int argc, char** argv) {
                         strata::prefill::Prefill::pipe_setting(),
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "",
+                        session_export_enabled ? " session_export=1" : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -11302,6 +11316,55 @@ int main(int argc, char** argv) {
             } else if (!next_line(line)) {
                 break;
             }
+            // Opt-in lifecycle protocol. INVENTORY emits one generation-bound list (including parked branches).
+            // EXPORT <generation> <id> <path> uses SAVE's writer without reclaim or cache/LRU mutations. All
+            // checkpoint/recurrent bytes are retained. Batch slot state and split stages do NOT have the same
+            // snapshot layout; refuse the entire inventory, even when those slots currently appear idle.
+            const bool inventory_command = line == "INVENTORY";
+            const bool export_command = line.rfind("EXPORT ", 0) == 0;
+            const strata::core::SavedConversation* export_parked = nullptr;
+            if (session_export_enabled && !inventory_command && !export_command) session_inventory.invalidate();
+            if (inventory_command || export_command) {
+                auto inventory_error = [&](const std::string& why) {
+                    std::printf("SERR invalid 0 %s\n", why.c_str()); std::fflush(stdout);
+                };
+                if (!session_export_enabled) { inventory_error("session export is disabled"); continue; }
+                std::vector<strata::core::SessionInventoryEntry> entries;
+                std::string why;
+                const bool supported = stages.empty() && !multi_gpu && o.peer_device < 1 && o.batch == 0 &&
+                                       o.prompt_cache > 0 && (live_ok || checks.empty()) && (!live.empty() || checks.empty());
+                try {
+                    if (!session_inventory.collect(conversations, supported, live_ok, live.size(), entries, why)) {
+                        inventory_error(why); continue;
+                    }
+                } catch (const std::bad_alloc&) {
+                    std::printf("SERR memory 0 not enough RAM for session inventory\n"); std::fflush(stdout);
+                    continue;
+                }
+                if (inventory_command) {
+                    const auto generation = session_inventory.generation();
+                    std::printf("INVENTORY %s %zu\n", generation.c_str(), entries.size());
+                    for (const auto& e : entries)
+                        std::printf("SESSION_ENTRY %s %s %zu\n", e.id.c_str(), e.kind.c_str(), e.tokens);
+                    std::printf("INVENTORY_END %s\n", generation.c_str()); std::fflush(stdout);
+                    continue;
+                }
+                const size_t first = line.find(' ', 7), second = first == std::string::npos ? first : line.find(' ', first + 1);
+                if (first == std::string::npos || second == std::string::npos || second + 1 == line.size()) {
+                    inventory_error("expected EXPORT <generation> <id> <path>"); continue;
+                }
+                const std::string generation = line.substr(7, first - 7), key = line.substr(first + 1, second - first - 1);
+                if (!session_inventory.matches(generation)) { inventory_error("stale session generation"); continue; }
+                const auto entry = std::find_if(entries.begin(), entries.end(), [&](const auto& e) { return e.id == key; });
+                if (entry == entries.end()) { inventory_error("unknown session id"); continue; }
+                if (entry->kind == "parked") {
+                    // Resolve by exact string, not a permissive integer parser.
+                    conversations.visit([&](uint64_t serial, const strata::core::SavedConversation& image) {
+                        if (key == "parked-" + std::to_string(serial)) export_parked = &image;
+                    });
+                }
+                line = "SAVE " + line.substr(second + 1);
+            }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
             if (line.rfind("BSTOP ", 0) == 0) {
@@ -11447,6 +11510,27 @@ int main(int argc, char** argv) {
                     refuse(std::string("session identity: ") + e.what(), strata::core::SessionError::io);
                     continue;
                 }
+                if (export_parked) {
+                    if (!strata::core::conversation_memory_admit(strata::core::available_host_bytes(),
+                            uint64_t(17) << 20, uint64_t(o.conversation_cache_min_free_mib) << 20)) {
+                        refuse("not enough RAM for parked session export buffer", strata::core::SessionError::memory);
+                        continue;
+                    }
+                    size_t bytes = 0;
+                    strata::core::SessionWriteOptions wo;
+                    wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                    wo.progress = moving; wo.phase = blocking;
+                    strata::core::SessionStatus st;
+                    try {
+                        if (!strata::core::session_file_write(path, *export_parked, id, bytes, err, wo, &st)) {
+                            refuse(err, st.error, st.published); continue;
+                        }
+                    } catch (const std::bad_alloc&) {
+                        refuse("not enough RAM to export parked session", strata::core::SessionError::memory); continue;
+                    }
+                    std::printf("SAVED %zu %zu %.1f\n", export_parked->live.ids.size(), bytes, ms());
+                    std::fflush(stdout); continue;
+                }
                 if (save) {
                     if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
                     size_t bytes = 0, kept = 0;
@@ -11474,7 +11558,7 @@ int main(int argc, char** argv) {
                             sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
-                        if (o.session_save_reclaim) {
+                        if (o.session_save_reclaim && !export_command) {
                             const auto freed = strata::core::session_save_reclaim(
                                 checks, conversations, sl, floor, strata::core::available_host_bytes);
                             if (freed.bytes || freed.checkpoints || freed.parked) {
@@ -11502,6 +11586,18 @@ int main(int argc, char** argv) {
                         if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why)) {
                             refuse(why, strata::core::SessionError::memory);
                             continue;
+                        }
+                        if (export_command) {
+                            uint64_t extra = 0;
+                            for (const auto& cp : checks) {
+                                if (cp.bytes() > (UINT64_MAX - extra) / 2) { extra = UINT64_MAX; break; }
+                                extra += 2 * cp.bytes();
+                            }
+                            const uint64_t peak = strata::core::session_save_peak_bytes(nullptr, sl);
+                            if (extra > UINT64_MAX - peak || !admit(peak + extra, why)) {
+                                refuse("not enough RAM to export every checkpoint", strata::core::SessionError::memory); continue;
+                            }
+                            disk_checks = checks;
                         }
                         kept = disk_checks.size();
                         const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};

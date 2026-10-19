@@ -33,9 +33,12 @@ VALUE_FLAGS = set('''--native --pack --ple-gguf --resident-budget-gib --expert-p
 --pool-workers --pool-affinity --batch --batch-groups --prompt-cache
 --prompt-cache-every --ple-io --ple-row-cache --ple-inflight --vram-reserve-mib
 --pcie-frac --adapt-swaps --suffix-draft --seed --temperature --top-p --top-k'''.split())
+VALUE_FLAGS.update('''--conversation-cache-mib --conversation-cache-slots
+--conversation-cache-min-tokens --conversation-cache-min-free-mib
+--session-min-free-mib'''.split())
 BOOL_FLAGS = {'--serve', '--mmap-experts', '--resident-cpu-experts', '--resident-pin', '--resident-experts'}
 SAFE_ENV = {'STRATA_PRECISION_POLICY', 'STRATA_EXPERIMENTAL_SM60', 'STRATA_SSD_KEEPALIVE',
-            'STRATA_SSD_KEEPALIVE_WINDOW', 'STRATA_POOL_TRACE'}
+            'STRATA_SSD_KEEPALIVE_WINDOW', 'STRATA_POOL_TRACE', 'STRATA_SESSION_EXPORT'}
 EXPERT = re.compile(r'^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$')
 TABLE = 'per_layer_token_embd.weight'
 LIMIT = 16 << 20

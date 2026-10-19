@@ -1,8 +1,8 @@
 """Opt-in persist-and-stop orchestration over an injected lane worker.
 
-No native Strata mapping is supplied: session_file(SAVE/RESTORE) addresses one
-current conversation under the service FIFO, not an enumerable set of all slots.
-Backend durable-checkpoint/migration capabilities therefore remain false.
+serve.native_lane supplies a restricted opt-in native mapping over inventory and
+export commands. Backend capability flags remain false pending GPU qualification;
+native batch-slot checkpoint coverage is not implied by this generic lifecycle.
 """
 from __future__ import annotations
 
