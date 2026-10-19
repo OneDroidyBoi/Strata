@@ -150,6 +150,14 @@ options/environment overrides and lower-bit weights fail closed. This is why an
 otherwise legitimate upstream configuration may be refused: support must be
 reviewed before widening the allowlist, not bypassed by ignoring its error.
 
+The pack index may declare 64-byte (the packer default) or 256-byte alignment;
+offsets and pool accounting must match that declaration. Explicit Q8_0-to-BF16
+`--compat-bf16` conversion is also admitted with NumPy installed, matching
+conversion/compatibility manifests and a fresh byte-level source/output check.
+The guard recomputes rounding error and exactness; it does not accept arbitrary
+quantized-to-float transformations. See [patched GPU qualification](GPU_MIGRATION_VALIDATION.md#patched-precision-qualification-2026-10-19)
+for the artifact contract and separate commit references.
+
 The current learned MTP pack is below the strict Q4 floor and is not admitted.
 Strict-policy startup also rejects vision/image sidecars before constructing them;
 their weight sources need separate auditing before that combination is supported.
@@ -528,7 +536,7 @@ accessed or reconfigured for this integration.
 From the repository root, run the CPU-only suites relevant to these components:
 
 ```sh
-python -m pip install jinja2==3.1.6 pytest==8.4.2
+python -m pip install jinja2==3.1.6 pytest==8.4.2 numpy==2.2.6
 python -m pytest -q tools/test_model_manifest.py serve/test_backends.py tools/test_backend_preflight.py serve/test_precision_policy.py serve/test_runtime_precision.py serve/test_resource_admission.py serve/test_request_admission.py serve/test_lane_lifecycle.py
 python -m pytest -q serve/test_slot_drain.py serve/test_session_protocol.py serve/test_native_lane.py serve/test_native_lane_controls.py serve/test_batch_checkpoint.py serve/test_batch_restore.py serve/test_bound_slot.py serve/test_lane_migration.py serve/test_migration_http.py serve/test_migration_http_integration.py
 python -m pytest -q serve/test_quiet_cancel.py serve/test_request_accounting.py serve/test_replicas.py serve/test_lifecycle.py

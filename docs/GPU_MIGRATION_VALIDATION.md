@@ -7,6 +7,57 @@ The existing HTTP and migration tests use fake engines. A real-model launcher
 for this procedure must still be assembled by the runner from its isolated
 worker setup and the owner APIs below; there is no turnkey migration CLI.
 
+## Patched precision qualification (2026-10-19)
+
+Keep the original pinned results unchanged. The runner reported a successful
+CUDA 12.9 SM70 build, 4,265 synthetic GPU snapshot checks, 972 host fixture checks
+and 347 CPU tests, followed by two strict preflight blockers before real-model
+load. These are runner-reported results, not independently reproduced here.
+Real-model continuation, HTTP routing and three-to-one remain pending.
+
+Two separate implementation fixes are available on `engine/backend-precision-foundation`:
+
+- `a994c75`: accept the packer's declared 64-byte alignment as well as 256-byte
+  packs. Validate dense offsets and destination pool accounting using the header.
+  No artifact repack is needed just to satisfy the guard. The existing 256-byte
+  runner repack remains eligible for fresh source/payload validation.
+- `6547b57`: reproduce explicit Q8_0-to-BF16 compatibility conversion, verify
+  source bytes and packed bytes, recompute maximum error and check manifests.
+  Q4 minimum and Q8 preference remain unchanged; converting low-bit source weights
+  to float does not evade the source precision audit.
+
+Label a run with either fix as PATCHED, recording its exact checkout and patch
+hashes. Do not call it an unmodified-pin PASS. Before loading, rerun strict audit
+against the actual artifact set; previous candidate verification is not enough.
+The conversion check requires NumPy. Its temporary arrays are bounded by chunks,
+not the entire tensor. The guard compares conversion method, source shard/hash,
+source/destination type, exactness, reported error, output byte count and exact
+Q8 conversion coverage in both manifests. Both exact and rounded Q8 conversions
+are allowed when their metadata matches the recomputed result.
+
+Use the packer's `--compat-bf16` output and an absolute source path, preserving
+`conversions.json` and `compat-bf16.json`. This remains a narrow subset: compatibility
+manifest entries for other rounded transforms are not yet admitted. Unknown
+quantized transforms must fail rather than silently gain support. Bind both
+manifests in the policy's optional `sha256` map for reproducible evidence; hashes
+are integrity bindings, not signatures. Keep policy and artifacts immutable
+through launch. Do not edit manifests to conceal a validation failure.
+
+The owner harness must derive and bind a verified ModelIdentity after READY and
+strict audit. Shared semantic identity must exclude per-worker device IDs, log
+paths, admission registrations and other placement details; preserve those in
+separate launch evidence. This does not relax model/tokenizer/config/state-layout
+compatibility checks. Keep worker admission registrations distinct.
+
+Local validation of the fixes: alignment suite 18 passed; final precision suite
+23 passed with NumPy, including tampered manifests/payloads, wrong shard/type,
+nonfinite/truncated sources, independently specified rounding values, chunk
+boundaries and exact conversions. A broader targeted suite before the final
+exact-conversion test passed 102 tests with four NumPy-dependent tests skipped in
+the lightweight interpreter; those conversion tests were separately run with
+NumPy. The CI environment now installs NumPy to run them. No GPU qualification
+or live 195-tensor audit was performed in the implementation checkout.
+
 ## Isolation and precision gates
 
 1. Inventory GPU UUIDs, processes, reserved devices, free VRAM, host RAM and disk
