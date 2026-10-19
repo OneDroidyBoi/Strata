@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/Niko1221/Strata.git",
+  "revision": "477ac13cbe8e582c20484871ce459d20d82df09d",
+  "fork": "https://github.com/OneDroidyBoi/Strata.git",
+  "development_branch": "engine/backend-precision-foundation",
+  "weight_policy": {
+    "minimum_bits": 4,
+    "preferred_bits": 8,
+    "scope": "all supplied learned target, PLE and draft tensors",
+    "runtime_enforcement": "not yet integrated"
+  },
+  "validation_scope": "offline artifact checks and CPU-side adapter tests; no running lanes"
+}
