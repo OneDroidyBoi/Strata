@@ -614,7 +614,6 @@ def seed_owner_prefix_fixture(harness: Any, *, agent: str, prompt_ids: list[int]
     if route is None or route.lane is None or type(route.slot) is not int:
         raise ValueError(f"{agent}: prefix fixture requires an active enrolled route")
     worker = harness.workers[route.lane]
-    engine = worker.engine
     p_ids = list(prompt_ids)
     c_ids = p_ids[:-tail_tokens]
     evidence = {
@@ -628,16 +627,15 @@ def seed_owner_prefix_fixture(harness: Any, *, agent: str, prompt_ids: list[int]
         persist(dict(evidence))
 
     try:
-        with engine.slot_cv:
-            held_before = list(engine.slot_held[route.slot])
+        generation_before, inventory_before, held_map_before = _public_lane_inventory(
+            worker, timeout_s=float(timeout_s))
+        held_before = list(held_map_before.get(route.slot, ()))
         # This is intentionally strict for the isolated comparison worker: a
         # non-empty slot means it is not a fresh cache-isolated baseline.
         if require_empty_slot and held_before:
             raise RuntimeError("fresh comparison slot is not empty before C seed")
         if require_empty_slot:
-            generation, _, inventory_snapshot = worker._snapshot()
-            inventory = inventory_snapshot[1]
-            if any(row[0] == f"slot-{route.slot}" for row in inventory):
+            if any(row[0] == f"slot-{route.slot}" for row in inventory_before):
                 raise RuntimeError("fresh comparison native inventory already contains the target slot")
         from threading import Event
         iterator = harness.coordinator.generate(agent, list(c_ids), 1,
@@ -650,15 +648,17 @@ def seed_owner_prefix_fixture(harness: Any, *, agent: str, prompt_ids: list[int]
             if callable(close):
                 close()
         output_ids = [token for token in yielded if token is not None]
-        # _snapshot is the native inventory read under the worker's ownership
-        # and exact process/drain guards; no direct HTTP or backend attachment.
-        generation, _, inventory_snapshot = worker._snapshot()
-        inventory = inventory_snapshot[1]
-        with engine.slot_cv:
-            held_after = list(engine.slot_held[route.slot])
+        # The public owner inventory operation gates/drains the lane while it
+        # captures native sessions and Python-held IDs, then resume() explicitly
+        # reopens it before any assertions or subsequent coordinator requests.
+        generation, inventory, held_map_after = _public_lane_inventory(
+            worker, timeout_s=float(timeout_s))
+        held_after = list(held_map_after.get(route.slot, ()))
         row = next((row for row in inventory if row[0] == f"slot-{route.slot}"), None)
         evidence.update({
-            "stage": "native-seed-observed", "process_generation": generation,
+            "stage": "native-seed-observed",
+            "native_inventory_generation_before_seed": generation_before,
+            "native_inventory_generation_after_seed": generation,
             "held_before_count": len(held_before),
             "held_after_token_ids": held_after,
             "held_after_count": len(held_after),
@@ -689,6 +689,49 @@ def seed_owner_prefix_fixture(harness: Any, *, agent: str, prompt_ids: list[int]
         if persist:
             persist(dict(evidence))
         raise
+
+
+def _public_lane_inventory(worker: Any, *, timeout_s: float) -> tuple[str, tuple, dict[int, tuple[int, ...]]]:
+    """Read slot state only through the owner's public gated inventory API.
+
+    ``quiesce_inventory`` leaves admission gated; every successful capture is
+    paired with an explicit ``resume`` before returning to the caller. A failed
+    inventory or resume is fail closed and never accesses worker-private snapshot
+    or engine slot fields.
+    """
+    capture = getattr(worker, "quiesce_inventory", None)
+    resume = getattr(worker, "resume", None)
+    if not callable(capture) or not callable(resume):
+        raise RuntimeError("worker lacks public native inventory lifecycle API")
+    result = capture(timeout_s)
+    if getattr(result, "state", None) != "inventoried":
+        raise RuntimeError(f"public native inventory failed: {getattr(result, 'error', None)}")
+    try:
+        generation = getattr(result, "generation", None)
+        sessions = getattr(result, "sessions", None)
+        held = getattr(result, "held", None)
+        if not isinstance(generation, str) or not generation:
+            raise RuntimeError("public native inventory omitted process generation")
+        if not isinstance(sessions, tuple) or not isinstance(held, tuple):
+            raise RuntimeError("public native inventory has malformed session/held tuples")
+        inventory = tuple(tuple(row) for row in sessions)
+        if any(len(row) != 3 or not isinstance(row[0], str) or not row[0]
+               or not isinstance(row[1], str) or not row[1]
+               or type(row[2]) is not int or row[2] < 0
+               for row in inventory):
+            raise RuntimeError("public native inventory contains malformed session rows")
+        held_map: dict[int, tuple[int, ...]] = {}
+        for row in held:
+            if (not isinstance(row, tuple) or len(row) != 2 or type(row[0]) is not int
+                    or row[0] < 0 or row[0] in held_map or not isinstance(row[1], tuple)
+                    or any(type(token) is not int for token in row[1])):
+                raise RuntimeError("public native inventory contains malformed held-slot rows")
+            held_map[row[0]] = row[1]
+        return generation, inventory, held_map
+    finally:
+        resumed = resume(timeout_s)
+        if getattr(resumed, "state", None) != "resumed":
+            raise RuntimeError(f"public native inventory resume failed: {getattr(resumed, 'error', None)}")
 
 
 def fresh_isolated_native_baseline(harness_factory: Callable[[], Any], *,

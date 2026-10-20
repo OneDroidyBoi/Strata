@@ -18,6 +18,7 @@ ready, identity-validated engine; clearing this flag alone is never a resume.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import math
 import re
 from pathlib import Path
@@ -27,6 +28,16 @@ import time
 from serve.backends import ModelIdentity, SessionMetadata
 from serve.lane_lifecycle import LaneLifecycle, LifecycleResult
 from serve.request_admission import RequestAdmission
+
+
+@dataclass(frozen=True)
+class NativeLaneInventory:
+    """Detached quiescent state; generation identifies native inventory, not PID."""
+    state: str
+    generation: str | None = None
+    sessions: tuple[tuple[str, str, int], ...] = ()
+    held: tuple[tuple[int, tuple[int, ...]], ...] = ()
+    error: str | None = None
 
 
 class NativeLaneWorker:
@@ -218,6 +229,39 @@ class NativeLaneWorker:
             if not isinstance(held, list) or len(held) != self.engine.batch:
                 raise ValueError('invalid native cached-slot routing metadata')
             return {i: tuple(tokens) for i, tokens in enumerate(held)}
+
+    def quiesce_inventory(self, timeout_s=30.0):
+        """Inspect a serving lane under full drain/FIFO/control ownership.
+
+        Success leaves admission gated. The owner must call resume() before
+        serving again. This establishes only an unchanged-state resume proof,
+        never the durable proof needed to release a slot or stop a lane.
+        Already gated lanes belong to their existing lifecycle operation.
+        """
+        if (isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float))
+                or not math.isfinite(timeout_s) or not 0 <= timeout_s <= 60):
+            raise ValueError('inventory timeout must be between 0 and 60 seconds')
+        with self._transaction():
+            ledger = self.admission.ledger.snapshot()
+            registered = ledger['workers'].get(self.admission.worker.worker_id)
+            if (self._restore_failed or self._gated_process is not None
+                    or getattr(self.service, 'native_lane_gated', False)
+                    or registered is None or registered['draining']):
+                return NativeLaneInventory('blocked', error='inventory requires a serving, ungated lane')
+            try:
+                self.gate_admission()
+                if not self.wait_drained(timeout_s):
+                    raise RuntimeError('inventory lane did not drain')
+                generation, _, detail = self._snapshot()
+                held = self._capture_routing()
+                self._owned(drained=True)
+                self._resume_inventory = detail
+                self._resume_held = held
+                return NativeLaneInventory('inventoried', generation, detail[1],
+                                           tuple(sorted(held.items())))
+            except Exception as exc:
+                failure = self._failure(exc)
+                return NativeLaneInventory('blocked', error=failure.error)
 
     def quiesce_snapshot(self, store, timeout_s=30.0):
         """Durably checkpoint EVERY native session and remain loaded, gated.

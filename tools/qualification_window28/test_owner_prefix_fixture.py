@@ -20,6 +20,7 @@ class FakeEngine:
         self.slot_held = [[]]
         self.info = {"slot_cache": 1, "session_export_batch": 1, "session_restore_batch": 1}
         self.gen = 1  # StrataEngine READY uses a positive integer lifecycle counter.
+        self.inventory_generation = "native-1"
         self.proc = SimpleNamespace(pid=4242, poll=lambda: None)
         self.last = {"reused": 0, "prompt_read": 0, "finish": "stop", "generated": 1}
         self.inventory_count_override = None
@@ -30,25 +31,47 @@ class FakeEngine:
 class FakeWorker:
     def __init__(self, engine):
         self.engine = engine
+        self.calls = []
+        self.gated = False
+        self.inventory_state = "inventoried"
+        self.resume_state = "resumed"
 
-    def _snapshot(self):
+    def quiesce_inventory(self, timeout_s=30.0):
+        self.calls.append(("quiesce_inventory", timeout_s))
+        if self.gated:
+            return SimpleNamespace(state="blocked", error="already gated")
+        self.gated = True
         count = self.engine.inventory_count_override
         if count is None:
             count = len(self.engine.slot_held[0])
-        rows = (("slot-0", "slot", count),) if count else ()
-        return self.engine.gen, tuple(row[0] for row in rows), (self.engine.gen, rows)
+        sessions = (("slot-0", "slot", count),) if count else ()
+        held = ((0, tuple(self.engine.slot_held[0])),)
+        return SimpleNamespace(state=self.inventory_state, generation=self.engine.inventory_generation,
+                               sessions=sessions, held=held, error=None)
+
+    def resume(self, timeout_s=30.0):
+        self.calls.append(("resume", timeout_s))
+        if not self.gated:
+            return SimpleNamespace(state="blocked", error="not gated")
+        if self.resume_state == "resumed":
+            self.gated = False
+        return SimpleNamespace(state=self.resume_state,
+                               error=None if self.resume_state == "resumed" else "resume failed")
 
 
 class FakeCoordinator:
     def __init__(self, engine):
         self.routes = {"agent-a": SimpleNamespace(lane="lane-a", slot=0)}
         self.engine = engine
+        self.calls = []
 
     def generate(self, agent, ids, max_new, sampling, cancel, *, timeout_s=30):
+        self.calls.append(("generate", max_new))
         ids = list(ids)
         if max_new == 1:
             output = [999]  # deliberately discarded; never appended to P/C
             self.engine.slot_held[0] = ids + output[:-1]
+            self.engine.inventory_generation = "native-2"
             self.engine.last = {"reused": 0, "prompt_read": len(ids), "finish": "stop", "generated": 1}
             self.engine.inventory_count_override = self.engine.override_inventory_after_generation
             if self.engine.mutate_held_after_generation:
@@ -126,11 +149,46 @@ class OwnerPrefixFixtureTests(unittest.TestCase):
         self.assertEqual(row["consumed_prefix_token_ids_C"], p[:-2])
         self.assertEqual(row["held_after_token_ids"], p[:-2])
         self.assertEqual(row["inventory_slot_tokens"], len(p) - 2)
+        self.assertEqual(row["native_inventory_generation_before_seed"], "native-1")
+        # Native inventory generation changes when the seed creates a slot;
+        # it is not the process generation and must not be held constant.
+        self.assertEqual(row["native_inventory_generation_after_seed"], "native-2")
         self.assertEqual(row["native_output_token_ids_discarded"], [999])
         self.assertTrue(row["drain_confirmed"])
         self.assertEqual(persisted[0]["stage"], "before-native-seed")
         self.assertEqual(persisted[0]["prompt_token_ids_P"], p)
         self.assertEqual(persisted[-1]["status"], "PASS")
+        self.assertEqual([call[0] for call in h.workers["lane-a"].calls],
+                         ["quiesce_inventory", "resume", "quiesce_inventory", "resume"])
+        self.assertFalse(h.workers["lane-a"].gated)
+
+    def test_inventory_uses_public_gated_api_and_never_private_snapshot(self):
+        h, _ = harness()
+        worker = h.workers["lane-a"]
+        worker._snapshot = lambda: self.fail("private snapshot must not be called")
+        qc.seed_owner_prefix_fixture(h, agent="agent-a", prompt_ids=[1, 2, 3, 4],
+                                     tail_tokens=1)
+        self.assertFalse(worker.gated)
+        self.assertEqual([name for name, _ in worker.calls],
+                         ["quiesce_inventory", "resume", "quiesce_inventory", "resume"])
+
+    def test_public_inventory_and_resume_fail_closed(self):
+        h, _ = harness()
+        worker = h.workers["lane-a"]
+        worker.inventory_state = "blocked"
+        with self.assertRaisesRegex(RuntimeError, "public native inventory failed"):
+            qc.seed_owner_prefix_fixture(h, agent="agent-a", prompt_ids=[1, 2, 3, 4],
+                                         tail_tokens=1)
+        self.assertEqual([name for name, _ in worker.calls], ["quiesce_inventory"])
+
+        h, _ = harness()
+        worker = h.workers["lane-a"]
+        worker.resume_state = "blocked"
+        with self.assertRaisesRegex(RuntimeError, "public native inventory resume failed"):
+            qc.seed_owner_prefix_fixture(h, agent="agent-a", prompt_ids=[1, 2, 3, 4],
+                                         tail_tokens=1)
+        self.assertTrue(worker.gated)
+        self.assertNotIn("generate", [name for name, _ in h.coordinator.calls])
 
     def test_inventory_or_slot_mismatch_is_a_hard_failure_after_evidence_persist(self):
         h, engine = harness()
