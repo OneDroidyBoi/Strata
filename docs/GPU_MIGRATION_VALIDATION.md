@@ -294,3 +294,68 @@ All links below identify the engine under test, not an evolving branch.
 - [Checkpoint store](https://github.com/OneDroidyBoi/Strata/blob/b61e8fc0fbea1b2954393f17f92af8405f74b271/serve/checkpoint_store.py), [batch restore tests](https://github.com/OneDroidyBoi/Strata/blob/b61e8fc0fbea1b2954393f17f92af8405f74b271/serve/test_batch_restore.py), [owned-slot tests](https://github.com/OneDroidyBoi/Strata/blob/b61e8fc0fbea1b2954393f17f92af8405f74b271/serve/test_bound_slot.py).
 - [Precision enforcement](https://github.com/OneDroidyBoi/Strata/blob/b61e8fc0fbea1b2954393f17f92af8405f74b271/serve/precision_policy.py), [admission](https://github.com/OneDroidyBoi/Strata/blob/b61e8fc0fbea1b2954393f17f92af8405f74b271/serve/request_admission.py).
 - [GPU snapshot fixture](https://github.com/OneDroidyBoi/Strata/blob/b61e8fc0fbea1b2954393f17f92af8405f74b271/src/core/conversation_snapshot_test.cpp), [native generation and slot protocol](https://github.com/OneDroidyBoi/Strata/blob/b61e8fc0fbea1b2954393f17f92af8405f74b271/src/program/generate.cpp).
+
+## Window27 prefix and recovery review
+
+Reviewed candidate driver SHA256
+`5afaede3955e582e789af5fea8e03163b7130872fd3dff2eefa930e5c211482a`
+and client SHA256
+`12a42239389e1d8f019c64629eee31e78e614f4d929131fb3dd08ce3f3d80f45`.
+The original failed run remains unqualified. No GPU or recovery action was taken
+by the implementation owner.
+
+Decoding the consumed suffix and putting it in assistant `content` does not
+ensure a lossless history. In the shipped template, a thinking-enabled generation
+prompt ends inside `<think>`, while a historical assistant content field follows
+an inserted reasoning block. Embedded turn terminators also are not automatically
+removed before the template appends its own terminator. Tokenizer decode/encode
+can introduce additional changes. The candidate's final strict C<P check must
+remain mandatory; the synthetic numeric tokenizer does not validate these cases.
+Three CPU regression cases using the shipped template and ByteTokenizer verify
+these template effects and exact token-prefix construction. They do not validate
+the deployed tokenizer or GPU execution.
+
+For a deterministic checkpoint-continuation fixture, construct P FIRST using the
+exact normal HTTP history, template kwargs and deployed tokenizer. Choose a
+positive tail length k smaller than len(P), and set C = P[:-k] without decoding
+or re-encoding either array. Seed C via coordinator.generate with max_new=1, fully
+consume/close its iterator and verify exact drain. The native owned terminal-token
+path publishes the consumed prompt into the bound slot (BOWN before BADM), even
+when that single generated token is EOS. Discard that unconsumed output from the
+fixture transcript; require actual slot_held == C and inventory count == len(C)
+before publishing. Failure of either check is a real failure, never permission to
+trim or rewrite the observed native state. Keep the checkpoint payload immutable.
+
+Use identical P for uninterrupted and restored branches, recording where reuse
+came from. This fixture tests continuation from a partially consumed normal HTTP
+prompt; its setup is native, not an end-to-end HTTP seeding test. Subsequent HTTP
+routing/restore still uses the original full-history request and must render
+exactly P. Natural multi-turn histories, reasoning removal and tool/turn boundary
+reuse need separate rotation coverage; do not claim those passed from this fixture.
+
+An unrelated cache-displacer prompt is not proof of a cold worker: the native
+conversation cache may park the displaced session and retain matching checkpoints.
+Use a fresh isolated comparison worker sequentially, or capture native provenance
+that proves the restored slot supplied the prefix. Equal slot IDs plus positive
+reused counters are insufficient to establish the source.
+
+Recovery r2 source review also found:
+
+- Per-service evidence is assembled but printed only after all assertions. Persist
+  bounded sanitized status/finish/length/hash fields for each probe before asserting,
+  including exception paths; never log authorization headers or raw credentials.
+- Four sequential reply probes allow 120 seconds each but the enclosing remote
+  operation allows only 180 seconds total. Give each probe its own bounded operation
+  or reconcile the outer deadline with their cumulative limits and supervisor budget.
+- Stopping the observer is only requested; cleanup then stops its host feed without
+  confirming observer exit. Keep the feed until the exact observer identity has
+  exited. On uncertain exit, preserve monitoring and report cleanup blocked. This
+  does not authorize weakening heartbeat or temperature gates.
+- A historical reply receipt's nonempty content is a separate predicate from a
+  current real reply. Record both outcomes so a stale historical receipt cannot be
+  misreported as a failed current model response. Do not remove either required gate
+  without the runner owner's review.
+
+Runner-owned files were read only; apply harness changes in a separate candidate,
+run the deployed-tokenizer prefix preflight locally if its artifacts are available,
+and version all overlays before the next GPU qualification.
