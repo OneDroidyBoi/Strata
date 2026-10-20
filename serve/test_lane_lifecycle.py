@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -74,6 +75,19 @@ class LifecycleTest(unittest.TestCase):
         result = self.lane.persist_and_stop()
         self.assertEqual(result.state, "stopped", result.error)
         return result.checkpoint_id
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'requires POSIX FIFO support')
+    def test_fifo_checkpoint_payload_is_rejected_without_waiting_for_writer(self):
+        fifo = self.root / 'unexpected-pipe'
+        os.mkfifo(fifo)
+        # Bound the regression externally: the old open() hangs before fstat.
+        probe = subprocess.run([sys.executable, '-c',
+            "from pathlib import Path; from serve.checkpoint_store import _digest; "
+            "import sys; _digest(Path(sys.argv[1]))", str(fifo)],
+            capture_output=True, text=True, timeout=2,
+            cwd=Path(__file__).resolve().parents[1])
+        self.assertNotEqual(probe.returncode, 0)
+        self.assertIn('regular non-symlink', probe.stderr)
 
     def test_durable_publish_then_stop_and_lazy_restore_after_restart(self):
         original_unload = self.worker.unload

@@ -32,7 +32,10 @@ def _sync_dir(path: Path) -> None:
 
 
 def _open_regular(path: Path):
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    # Opening a FIFO read-only can block before fstat gets to reject it.
+    # NONBLOCK has no effect on regular files; inspect the actual opened inode.
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_NONBLOCK", 0))
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or path.is_symlink():
