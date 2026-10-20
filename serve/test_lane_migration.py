@@ -322,6 +322,33 @@ class LaneMigrationIntegrationTests(unittest.TestCase):
                                  {'a': ('lane-0', 0), 'b': ('lane-1', 0)}, enabled=True)
         self.assertEqual(self.events, [])
 
+    def test_invalid_owner_requests_do_not_poison_healthy_lanes(self):
+        for operation, args in ((self.coordinator.activate, ('missing',)),
+                                (self.coordinator.activate, ([],)),
+                                (self.coordinator.consolidate, ('missing',)),
+                                (self.coordinator.consolidate, ([],))):
+            with self.subTest(operation=operation.__name__, args=args):
+                with self.assertRaises(ValueError):
+                    operation(*args)
+                self.assertFalse(self.coordinator._blocked)
+        for operation, name in ((self.coordinator.activate, 'agent-0'),
+                                (self.coordinator.consolidate, self.destination)):
+            for timeout in (True, -1, float('nan'), 61):
+                with self.subTest(operation=operation.__name__, timeout=timeout):
+                    with self.assertRaises(ValueError):
+                        operation(name, timeout_s=timeout)
+                    self.assertFalse(self.coordinator._blocked)
+        for agent in ('missing', []):
+            with self.assertRaises(ValueError):
+                with self.coordinator.route(agent):
+                    self.fail('invalid agent was routed')
+        self.assertFalse(self.coordinator._blocked)
+        self.assertIsNone(self.coordinator._destination)
+        self.assertEqual(self.events, [])
+        for service in self.services.values():
+            self.assertFalse(getattr(service, 'native_lane_gated', False))
+        self.consolidate()
+
     def test_route_lock_timeout_is_retryable_and_preserves_owner_lock(self):
         from serve.lane_migration import MigrationBusy
         def attempt():

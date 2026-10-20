@@ -187,13 +187,14 @@ class MigrationCoordinator:
 
     def consolidate(self, destination, timeout_s=30.0):
         """Snapshot every lane before retiring any; retain overflow on disk."""
+        self._timeout(timeout_s)
+        if not isinstance(destination, str) or destination not in self.lanes:
+            raise ValueError('unknown destination lane')
         if not self._operation.acquire(blocking=False):
             return self._result('waiting', 'another routing operation is running')
         try:
             if self._blocked or self._destination is not None:
                 raise RuntimeError('coordinator is blocked or already consolidated')
-            if destination not in self.lanes:
-                raise ValueError('unknown destination lane')
             self._idle(timeout_s)
             self._destination = destination
             self._journal('preparing')
@@ -231,6 +232,11 @@ class MigrationCoordinator:
             return self._fail(exc)
         finally:
             self._operation.release()
+
+    def _validate_agent(self, agent):
+        # Input errors occur before any native work; they must not gate all lanes.
+        if not isinstance(agent, str) or agent not in self._routes:
+            raise ValueError('unknown agent')
 
     def _activate(self, agent, timeout_s):
         if self._blocked:
@@ -271,6 +277,8 @@ class MigrationCoordinator:
 
     def activate(self, agent, timeout_s=30.0):
         """Bring a parked agent into a slot; durable LRU parking makes room."""
+        self._validate_agent(agent)
+        self._timeout(timeout_s)
         if not self._operation.acquire(blocking=False):
             return self._result('waiting', 'another routing operation is running')
         try:
@@ -293,6 +301,7 @@ class MigrationCoordinator:
         This is an owner primitive, not permission to bypass admission. Prefer
         generate(), which also binds native dispatch and exact drain receipts.
         """
+        self._validate_agent(agent)
         self._timeout(timeout_s)
         deadline = time.monotonic() + timeout_s
         if not self._operation.acquire(timeout=timeout_s):

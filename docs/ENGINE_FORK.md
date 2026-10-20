@@ -594,3 +594,9 @@ These are Python-only changes, separately versioned from the runner's current
 qualification overlays. They do not establish GPU continuation correctness and
 should not be applied to an in-progress qualification run. Precision requirements
 remain Q4 minimum and Q8 or higher preferred.
+
+Direct coordinator calls now reject unknown/malformed agent or destination names
+and invalid timeouts with ValueError before entering a mutating operation. Such
+caller errors do not gate healthy lanes or mark the coordinator blocked. Native
+snapshot, restore, process-identity and integrity failures still fail closed.
+The HTTP gateway already validates these inputs; its response contract is unchanged.
