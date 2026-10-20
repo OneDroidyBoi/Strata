@@ -89,3 +89,39 @@ closes the harness on initial validation failure. PID reuse via a replacement
 Popen is rejected. Cross-process adoption still requires independent start-time
 binding. `generation-identity.patch` is historical: it applies only to the old
 b3d4955a client and does not include the newer public-inventory correction.
+
+## Reusable orchestration contracts: window30 follow-up
+
+Runner-reported on 2026-10-20: window30 validated the aab3182 integration but
+encountered two repeated orchestration mismatches before GPU qualification.
+The controller expected a soak-r1 receipt while its helper emitted r2. Observer
+bootstrap again omitted feed start ticks and complete ready publication. The
+runner reports repairing the receipt check and adopting the existing observer
+and feed using verified process identities, without restarting them. These are
+orchestration findings, not new engine defects or GPU qualification evidence.
+The corrected controller hash reported by the runner is
+`ac504b872cec57d30d1ea2e43458c94fb4ba7bcc72a033857ebd4901d33cc534`.
+Its reported ten tests include the exact helper receipt schema; this thread did
+not independently rerun those window30 tests.
+
+Future reusable runner tests should exercise the actual producer and consumer
+together, rather than separately maintained idealized receipt dictionaries:
+
+- Feed the exact soak helper's emitted receipt through the full launch
+  predicate, including its schema version and feed port. Exercise a valid
+  complete receipt and reject wrong versions, missing fields and stale data.
+- Feed the actual bootstrap result through the prepare helper. Require observer
+  and feed PIDs, start ticks, port and root identity before publishing ready
+  state or invoking soak. Missing start ticks must publish no ready receipt and
+  start no soak. This is separate from matching a PID alone.
+- Exercise verified adoption after bootstrap succeeded but preparation failed.
+  A matching PID with different start ticks must be rejected; valid adoption
+  must not spawn duplicate observers or feeds. Keep process control mocked in
+  CPU tests and preserve failed-window evidence.
+- Execute the complete launch predicate with real temporary files and their
+  hashes, canonical paths, and producer-generated receipts. Mock only external
+  process/time/transport boundaries. Bind the test result to the exact candidate
+  sources so copying an older window cannot silently restore these mismatches.
+
+These are follow-up test requirements, not implemented orchestration tests in
+this repository. They do not change or gate window30's already active soak.
