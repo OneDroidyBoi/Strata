@@ -1,0 +1,134 @@
+--- a/qualification_client.py
++++ b/qualification_client.py
+@@ -711,24 +711,34 @@
+     if max_new not in (1, 4, 8, 16, 32):
+         raise ValueError("baseline generation length is outside the bounded probe set")
+     harness = harness_factory()
+-    if getattr(harness, "stage", None) != "single_worker" or len(harness.workers) != 1:
+-        raise RuntimeError("comparison factory did not return a single-worker harness")
+-    only_worker = next(iter(harness.workers.values()))
+-    process = getattr(only_worker.engine, "proc", None)
+-    if (process is None or type(getattr(process, "pid", None)) is not int or process.pid <= 0
+-            or not callable(getattr(process, "poll", None)) or process.poll() is not None
+-            or not isinstance(getattr(only_worker.engine, "gen", None), str)
+-            or not only_worker.engine.gen):
+-        raise RuntimeError("comparison harness lacks a live, identified fresh native process")
+-    process_identity = {"pid": process.pid, "generation": only_worker.engine.gen,
+-                        "alive_at_start": True, "worker_count": 1}
+-    fixture_routes = {item[0] for item in fixtures.values() if isinstance(item, tuple) and len(item) == 3}
+-    if len(fixture_routes) == 0 or fixture_routes - set(harness.coordinator.routes):
+-        raise RuntimeError("comparison harness is missing one or more fixture routes")
+-    rows = {}
+-    used_routes: set[str] = set()
+     try:
++        if getattr(harness, "stage", None) != "single_worker" or len(harness.workers) != 1:
++            raise RuntimeError("comparison factory did not return a single-worker harness")
++        only_worker = next(iter(harness.workers.values()))
++        engine = only_worker.engine
++        process = getattr(engine, "proc", None)
++        generation = getattr(engine, "gen", None)
++        if (process is None or type(getattr(process, "pid", None)) is not int or process.pid <= 0
++                or not callable(getattr(process, "poll", None)) or process.poll() is not None
++                or type(generation) is not int or generation <= 0):
++            raise RuntimeError("comparison harness lacks a live, identified fresh native process")
++        process_identity = {"pid": process.pid, "generation": generation,
++                            "alive_at_start": True, "worker_count": 1}
++        fixture_routes = {item[0] for item in fixtures.values() if isinstance(item, tuple) and len(item) == 3}
++        if len(fixture_routes) == 0 or fixture_routes - set(harness.coordinator.routes):
++            raise RuntimeError("comparison harness is missing one or more fixture routes")
++        rows = {}
++        used_routes: set[str] = set()
++        def check_process():
++            # A PID can be reused. Pin the actual Popen object and the READY
++            # lifecycle counter, which Strata increments on each ready process.
++            if (only_worker.engine is not engine or engine.proc is not process
++                    or type(getattr(engine, "gen", None)) is not int
++                    or engine.gen != generation or process.pid != process_identity["pid"]
++                    or process.poll() is not None):
++                raise RuntimeError("comparison native process or generation changed")
+         for fixture_name, (agent, messages, tail) in fixtures.items():
++            check_process()
+             if not isinstance(messages, list) or any(not isinstance(x, dict) for x in messages):
+                 raise ValueError(f"{fixture_name}: fixture history must be a normal HTTP message list")
+             if agent not in harness.coordinator.routes:
+@@ -739,9 +749,11 @@
+                                                tail_tokens=tail,
+                                                require_empty_slot=agent not in used_routes,
+                                                persist=(lambda row, a=fixture_name: persist(a, {"seed": row})) if persist else None)
++            check_process()
+             probe = collect_token_ids(harness.coordinator, harness.workers, agent=agent,
+                                       prompt_ids=prompt, max_new=max_new,
+                                       sampling={"temperature": 0.0})
++            check_process()
+             if not 0 < len(probe.get("output_token_ids", [])) <= max_new:
+                 raise RuntimeError(f"{fixture_name}: fresh native baseline returned no bounded token sequence")
+             reused, prompt_read = probe.get("reused"), probe.get("prompt_read")
+@@ -760,6 +772,7 @@
+             used_routes.add(agent)
+             if persist:
+                 persist(fixture_name, row)
++        check_process()
+         return rows
+     finally:
+         close_harness(harness)
+--- a/test_owner_prefix_fixture.py
++++ b/test_owner_prefix_fixture.py
+@@ -19,7 +19,7 @@
+         self.slot_cv = threading.RLock()
+         self.slot_held = [[]]
+         self.info = {"slot_cache": 1, "session_export_batch": 1, "session_restore_batch": 1}
+-        self.gen = "fresh-process-1"
++        self.gen = 1  # StrataEngine READY uses a positive integer lifecycle counter.
+         self.proc = SimpleNamespace(pid=4242, poll=lambda: None)
+         self.last = {"reused": 0, "prompt_read": 0, "finish": "stop", "generated": 1}
+         self.inventory_count_override = None
+@@ -73,6 +73,49 @@
+ 
+ 
+ class OwnerPrefixFixtureTests(unittest.TestCase):
++    def test_missing_or_invalid_ready_generation_rejected_and_closed(self):
++        for value in (None, True, 0, -1, 1.0, "fresh-process-1"):
++            with self.subTest(value=value):
++                h, engine = harness()
++                if value is None:
++                    del engine.gen  # proc exists, but READY generation is absent
++                else:
++                    engine.gen = value
++                closed, saved = [], []
++                with self.assertRaisesRegex(RuntimeError, "live, identified"):
++                    qc.fresh_isolated_native_baseline(lambda: h,
++                        fixtures={"alpha": ("agent-a", [], 2)},
++                        close_harness=closed.append,
++                        persist=lambda *args: saved.append(args))
++                self.assertEqual(closed, [h])
++                self.assertEqual(saved, [])
++                self.assertEqual(engine.slot_held, [[]])
++
++    def test_process_change_during_seed_or_continuation_rejects_baseline(self):
++        for phase in ("seed", "continuation"):
++            for change in ("generation", "same_pid_new_process", "exit"):
++                with self.subTest(phase=phase, change=change):
++                    h, engine = harness()
++                    original = h.coordinator.generate
++                    def generate(agent, ids, max_new, sampling, cancel, **kwargs):
++                        yield from original(agent, ids, max_new, sampling, cancel, **kwargs)
++                        if (max_new == 1) == (phase == "seed"):
++                            if change == "generation":
++                                engine.gen += 1
++                            elif change == "same_pid_new_process":
++                                engine.proc = SimpleNamespace(pid=4242, poll=lambda: None)
++                            else:
++                                engine.proc.poll = lambda: 0
++                    h.coordinator.generate = generate
++                    closed, saved = [], []
++                    with self.assertRaises(RuntimeError):
++                        qc.fresh_isolated_native_baseline(lambda: h,
++                            fixtures={"alpha": ("agent-a", [], 2)},
++                            close_harness=closed.append,
++                            persist=lambda _, row: saved.append(row))
++                    self.assertEqual(closed, [h])
++                    self.assertFalse(any("baseline" in row for row in saved))
++
+     def test_p_first_strict_prefix_seed_drains_and_matches_slot_and_inventory(self):
+         h, engine = harness()
+         persisted = []
