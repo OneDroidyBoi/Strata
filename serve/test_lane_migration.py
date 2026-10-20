@@ -394,6 +394,48 @@ class LaneMigrationIntegrationTests(unittest.TestCase):
             self.assertFalse(self.services[self.destination].native_lane_gated)
         self.assertEqual(self.coordinator.activate(parked).state, 'ready')
 
+    def test_rotation_journal_failure_after_release_preserves_both_agents(self):
+        self.consolidate()
+        routes = self.coordinator.routes
+        incoming = next(a for a, r in routes.items() if r.lane is None)
+        resident = [a for a, r in routes.items() if r.lane is not None]
+        engine = self.services[self.destination].engine
+        # Include work completed since consolidation: the old bundle alone
+        # would not suffice to recover the agent evicted during this rotation.
+        expected = dict(self.original)
+        for agent in resident:
+            slot = routes[agent].slot
+            expected[agent] = self.original[agent] + [901, 902]
+            engine.states[slot] = list(expected[agent])
+            engine.slot_held[slot] = list(expected[agent])
+        engine.epoch += 1
+        journal = self.coordinator._journal
+        def fail_after_release(phase, error=None):
+            if phase == 'slot-released':
+                raise OSError('injected post-release journal failure')
+            return journal(phase, error)
+        start = len(self.events)
+        with patch.object(self.coordinator, '_journal', fail_after_release):
+            result = self.coordinator.activate(incoming)
+        self.assertEqual(result.state, 'blocked')
+        self.assertIn('post-release journal failure', result.error)
+        commands = [command for _, command in self.events[start:]]
+        self.assertEqual(commands.count('RELEASE_SLOT'), 1)
+        self.assertNotIn('RESTORE_SLOT', commands)
+        self.assertNotIn('CLOSE', commands)
+        self.assertTrue(engine.alive())
+        self.assertTrue(self.services[self.destination].native_lane_gated)
+        # Use only the on-disk journal, as an owner recovering after shutdown
+        # would; neither incoming nor evicted state may depend on live memory.
+        durable = json.loads(self.coordinator.journal_path.read_text())
+        self.assertEqual(durable['phase'], 'blocked')
+        for agent in [incoming, *resident]:
+            route = durable['agents'][agent]
+            saved = []
+            self.store.restore(route['checkpoint_id'], route['session_id'], self.model,
+                               lambda _, path: saved.append(json.loads(path.read_bytes())))
+            self.assertEqual(saved, [expected[agent]])
+
     def test_corrupt_parked_payload_is_rejected_before_any_release(self):
         self.consolidate()
         routes = self.coordinator.routes
