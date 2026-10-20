@@ -195,6 +195,32 @@ class LifecycleTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.store.sessions(bad, self.model)
 
+    def test_ambiguous_manifest_is_rejected_before_reader(self):
+        checkpoint = self.publish()
+        path = self.root / checkpoint / 'manifest.json'
+        original = path.read_text()
+        manifest = json.loads(original)
+        digest = manifest['sessions'][0]['sha256']
+        cases = [
+            original.replace('"version":1', '"version":true'),
+            original.replace('"version":1', '"version":1.0'),
+            '{"sessions":[],' + original[1:],
+            original.replace('"sha256":"' + digest + '"',
+                             '"sha256":"' + '0' * 64 + '","sha256":"' + digest + '"', 1),
+            '{"unexpected":NaN,' + original[1:],
+        ]
+        for text in cases:
+            with self.subTest(text=text[:90]):
+                path.write_text(text)
+                called = []
+                with self.assertRaises(ValueError):
+                    self.store.restore(checkpoint, 's0', self.model, lambda *_: called.append(True))
+                self.assertEqual(called, [])
+        path.write_text(original)
+        called = []
+        self.store.restore(checkpoint, 's0', self.model, lambda *_: called.append(True))
+        self.assertEqual(called, [True])
+
     def test_payload_symlink_is_rejected_on_export_and_restore(self):
         outside = self.root / "outside"
         outside.write_bytes(b"data")

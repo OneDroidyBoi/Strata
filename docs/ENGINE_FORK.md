@@ -607,3 +607,10 @@ timing is finite and nonnegative. A mismatch blocks publication/source shutdown
 and retains fixed residency. Checksums still validate bytes independently; neither
 check establishes GPU continuation parity. Injected native-worker implementations
 must return the same `tokens`, `bytes`, `ms` dictionary as SessionProtocol.export.
+
+Checkpoint manifests reject duplicate JSON fields at every nesting level,
+nonstandard NaN/Infinity constants, and non-integer version values before invoking
+any restore reader. Previously the standard JSON parser silently selected the last
+duplicate field, and Python equality admitted true/1.0 as version 1. Valid published
+version-1 bundles are unchanged. This is malformed-metadata rejection within the
+trusted local store contract, not a new authentication or hostile-filesystem claim.

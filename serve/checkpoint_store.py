@@ -119,8 +119,20 @@ class CheckpointStore:
             data = f.read(_MAX_MANIFEST + 1)
         if len(data) > _MAX_MANIFEST:
             raise ValueError("checkpoint manifest too large")
-        manifest = json.loads(data)
-        if not isinstance(manifest, dict) or manifest.get("version") != _VERSION:
+        def unique_fields(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate checkpoint manifest field: " + key)
+                result[key] = value
+            return result
+
+        def invalid_constant(value):
+            raise ValueError("invalid checkpoint JSON constant: " + value)
+
+        manifest = json.loads(data, object_pairs_hook=unique_fields, parse_constant=invalid_constant)
+        if (not isinstance(manifest, dict) or type(manifest.get("version")) is not int
+                or manifest["version"] != _VERSION):
             raise ValueError("unsupported checkpoint version")
         if manifest.get("checkpoint_id") != checkpoint_id or manifest.get("model") != asdict(model):
             raise ValueError("checkpoint model or bundle identity mismatch")
