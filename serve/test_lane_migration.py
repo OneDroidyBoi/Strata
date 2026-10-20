@@ -322,6 +322,27 @@ class LaneMigrationIntegrationTests(unittest.TestCase):
                                  {'a': ('lane-0', 0), 'b': ('lane-1', 0)}, enabled=True)
         self.assertEqual(self.events, [])
 
+    def test_route_lock_timeout_is_retryable_and_preserves_owner_lock(self):
+        from serve.lane_migration import MigrationBusy
+        def attempt():
+            with self.coordinator.route('agent-0', timeout_s=0.01):
+                self.fail('route acquired an operation owned by another thread')
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            self.coordinator._operation.acquire()
+            try:
+                future = pool.submit(attempt)
+                with self.assertRaises(MigrationBusy):
+                    future.result(timeout=0.3)
+                self.assertTrue(self.coordinator._operation.locked())
+                self.assertEqual(self.events, [])
+                self.assertFalse(self.coordinator._blocked)
+                self.assertEqual(self.coordinator._active, set())
+            finally:
+                self.coordinator._operation.release()
+        with self.coordinator.route('agent-0', timeout_s=0):
+            self.assertIn('agent-0', self.coordinator._active)
+        self.assertEqual(self.coordinator._active, set())
+
     def test_active_turn_timeout_is_retryable_without_gating_or_native_mutation(self):
         with self.coordinator.route('agent-0'):
             result = self.coordinator.consolidate(self.destination, timeout_s=0)

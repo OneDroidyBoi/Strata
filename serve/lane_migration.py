@@ -293,10 +293,13 @@ class MigrationCoordinator:
         This is an owner primitive, not permission to bypass admission. Prefer
         generate(), which also binds native dispatch and exact drain receipts.
         """
-        with self._operation:
+        self._timeout(timeout_s)
+        deadline = time.monotonic() + timeout_s
+        if not self._operation.acquire(timeout=timeout_s):
+            raise MigrationBusy('another routing operation is running')
+        try:
             try:
-                self._timeout(timeout_s)
-                self._activate(agent, timeout_s)
+                self._activate(agent, max(0.0, deadline - time.monotonic()))
                 with self._cv:
                     if agent in self._active:
                         raise MigrationBusy('agent already has an active turn')
@@ -309,6 +312,8 @@ class MigrationCoordinator:
             except Exception as exc:
                 self._fail(exc)
                 raise
+        finally:
+            self._operation.release()
         try:
             yield route
         finally:
