@@ -1,0 +1,39 @@
+--- a/run_three_worker_migration.py
++++ b/run_three_worker_migration.py
+@@ -594,10 +594,12 @@
+                                       messages_by_agent: dict, agents: tuple[str, str],
+                                       operator_token: str, receipt_evidence: ReceiptEvidence,
+                                       expected_prefixes: dict, expected_prompts: dict,
++                                      expected_consumed_prefixes: dict,
+                                       results) -> tuple[list, dict]:
+     """Exercise a genuine busy response, drain exact receipts, restore branch, retry once."""
+     import qualification_client as qc
+-    prefixes = qc.checkpoint_prefixes(harness, expected_prompts=expected_prompts)
++    prefixes = qc.checkpoint_prefixes(harness, expected_prompts=expected_prompts,
++                                      expected_consumed_prefixes=expected_consumed_prefixes)
+     qc.assert_saved_slot_state_equal(expected_prefixes, prefixes)
+     before_routes = {a: (r.lane, r.slot) for a, r in harness.coordinator.routes.items()}
+     rows = []
+@@ -930,7 +932,11 @@
+                     "C_count": prefix_seed_rows[agent]["C_count"],
+                     "status": prefix_seed_rows[agent]["status"]}
+             for agent in AGENTS})
+-        aligned_prefixes = qc.checkpoint_prefixes(harness, expected_prompts=prompts)
++        expected_consumed_prefixes = {
++            agent: list(prefix_baseline["fixtures"][agent]["consumed_prefix_token_ids_C"])
++            for agent in AGENTS}
++        aligned_prefixes = qc.checkpoint_prefixes(harness, expected_prompts=prompts,
++                                                  expected_consumed_prefixes=expected_consumed_prefixes)
+         atomic_json(result_dir / "native-prefix-checkpoints.json", aligned_prefixes)
+         qc.assert_current_slots_match_saved(harness, aligned_prefixes)
+         native = {"first": native_first, "prefixes": aligned_prefixes,
+@@ -947,7 +953,8 @@
+             client, harness, model=model, messages_by_agent=matrix_histories,
+             agents=source_agents, operator_token=operator,
+             receipt_evidence=receipt_evidence, expected_prefixes=aligned_prefixes,
+-            expected_prompts=prompts, results=results)
++            expected_prompts=prompts, expected_consumed_prefixes=expected_consumed_prefixes,
++            results=results)
+         atomic_json(result_dir / "busy-consolidation.json",
+                     [{"name": p.name, "status": p.status, "http_status": p.http_status,
+                       "started_at": p.started_at, "completed_at": p.completed_at,

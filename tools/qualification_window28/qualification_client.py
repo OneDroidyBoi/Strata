@@ -935,8 +935,30 @@ def prime_exact_full_history_prompts(client: Any, harness: Any, *, model: str,
     return prompts, evidence
 
 
-def checkpoint_prefixes(harness: Any, *, expected_prompts: Mapping[str, list[int]] | None = None) -> dict[str, dict]:
-    """Durably checkpoint every enrolled slot, then resume the unchanged lane."""
+def checkpoint_prefixes(harness: Any, *, expected_prompts: Mapping[str, list[int]] | None = None,
+                        expected_consumed_prefixes: Mapping[str, list[int]] | None = None) -> dict[str, dict]:
+    """Checkpoint enrolled slots, enforcing the explicitly selected seed contract.
+
+    P-first fixtures supply exact C as well as P: held must equal C and C must
+    be a nonempty strict prefix of P. Without C, retain the legacy contract for
+    a fully consumed prompt (P is a prefix of held). Never accept either shape
+    indiscriminately; doing so would hide wrong or advanced checkpoint state.
+    """
+    consumed = None
+    if expected_consumed_prefixes is not None:
+        agents = set(harness.coordinator.routes)
+        if (expected_prompts is None or set(expected_prompts) != agents
+                or set(expected_consumed_prefixes) != agents):
+            raise ValueError('P-first checkpoints require exact P/C coverage for every agent')
+        consumed = {}
+        expected_prompts = {agent: list(ids) for agent, ids in expected_prompts.items()}
+        for agent, ids in expected_consumed_prefixes.items():
+            prompt = expected_prompts[agent]
+            if (not isinstance(ids, (list, tuple)) or not 0 < len(ids) < len(prompt)
+                    or any(type(token) is not int for token in (*ids, *prompt))
+                    or list(ids) != prompt[:len(ids)]):
+                raise ValueError(f'{agent}: expected C must be a nonempty exact strict prefix of P')
+            consumed[agent] = tuple(ids)
     prefixes = {}
     for lane, worker in harness.workers.items():
         result = worker.quiesce_snapshot(harness.store, 30.0)
@@ -989,7 +1011,14 @@ def checkpoint_prefixes(harness: Any, *, expected_prompts: Mapping[str, list[int
                     if not isinstance(prompt, list):
                         raise RuntimeError(f"{agent}: expected full-history prompt is missing")
                     alignment = prefix_relation(prompt, held)
-                    if not (alignment["left_is_strict_prefix"] or alignment["equal"]):
+                    if consumed is not None:
+                        if held != consumed[agent]:
+                            raise RuntimeError(f"{agent}: saved checkpoint does not equal exact seeded C "
+                                               f"(expected={len(consumed[agent])}, held={len(held)}, "
+                                               f"prompt_lcp={alignment['lcp_tokens']})")
+                        prefixes[agent]['seed_contract'] = 'exact-C-strict-prefix-of-P'
+                        prefixes[agent]['expected_C_sha256'] = token_ids_sha256(consumed[agent])
+                    elif not (alignment["left_is_strict_prefix"] or alignment["equal"]):
                         raise RuntimeError(f"{agent}: saved checkpoint no longer holds its exact prompt prefix")
                     prefixes[agent]["prompt_alignment"] = alignment
         resumed = worker.resume(30.0)

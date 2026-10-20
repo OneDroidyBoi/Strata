@@ -232,8 +232,62 @@ class QualificationLifecycleTests(unittest.TestCase):
         for agent, ids in prompts.items():
             row = qc.seed_owner_prefix_fixture(h, agent=agent, prompt_ids=ids, tail_tokens=2)
             self.assertEqual(row['status'], 'PASS')
-        result = h.coordinator.consolidate('lane-2')
-        self.assertEqual(result.state, 'consolidated', result.error)
+        consumed = {agent: ids[:-2] for agent, ids in prompts.items()}
+        prefixes = qc.checkpoint_prefixes(h, expected_prompts=prompts,
+                                          expected_consumed_prefixes=consumed)
+        qc.assert_current_slots_match_saved(h, prefixes)
+        # Exercise the second checkpoint used by the busy-request branch, then
+        # advance that disposable branch and restore all exact saved prefixes.
+        second = qc.checkpoint_prefixes(h, expected_prompts=prompts,
+                                        expected_consumed_prefixes=consumed)
+        qc.assert_saved_slot_state_equal(prefixes, second)
+        driver_path = Path(__file__).resolve().parents[1] / 'tools/qualification_window28/run_three_worker_migration.py'
+        spec = importlib.util.spec_from_file_location('lifecycle_qualification_driver', driver_path)
+        driver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(driver)
+        release = threading.Event()
+        receipts = {}
+        class Client:
+            client_api_key = 'cpu-fixture'
+            def request(self, endpoint, *, agent_id, **kwargs):
+                iterator = h.coordinator.generate(agent_id, prompts[agent_id], 4, {}, threading.Event())
+                try:
+                    next(iterator)
+                    worker = h.workers[h.coordinator.routes[agent_id].lane]
+                    receipts[agent_id] = worker.engine.pending[-1][0]
+                    if not release.wait(5):
+                        raise RuntimeError('CPU busy request was not released')
+                    list(iterator)
+                    return qc.Probe('request', 'PASS', 0, 1, 200)
+                finally:
+                    iterator.close()
+            def _call(self, endpoint, body, **kwargs):
+                try:
+                    result = h.coordinator.consolidate('lane-2', timeout_s=0.01)
+                    return (503 if result.state == 'waiting' else 200), {}, b'{}'
+                finally:
+                    release.set()
+            def consolidate(self, **kwargs):
+                result = h.coordinator.consolidate('lane-2')
+                return qc.Probe('consolidation', 'PASS' if result.state == 'consolidated' else 'FAIL', 0, 1, 200)
+        class ReceiptEvidence:
+            def both_agents_active_with_receipts(self, agents):
+                return all(a in receipts and not receipts[a].confirmed() for a in agents)
+            def last_agent_drained(self, agent):
+                receipt = receipts[agent]
+                return {'receipt_confirmed': receipt.confirmed(), 'receipt_failed': receipt.failed(),
+                        'ticket_count': 1}
+        with patch.dict(sys.modules, {'qualification_client': qc}):
+            rows, saved = driver.busy_503_restore_then_consolidate(Client(), h,
+                model='cpu-fixture', messages_by_agent={a: [] for a in prompts},
+                agents=('agent-0', 'agent-2'), operator_token='cpu-fixture',
+                receipt_evidence=ReceiptEvidence(), expected_prefixes=second,
+                expected_prompts=prompts, expected_consumed_prefixes=consumed,
+                results=qc.JsonlResults(self.root / 'busy-results.jsonl'))
+        self.assertEqual(rows[0].http_status, 503)
+        self.assertTrue(all(row.status == 'PASS' for row in rows))
+        qc.assert_saved_slot_state_equal(second, saved)
+        qc.assert_routes_reference_saved_payloads(h, second)
         self.assertEqual(sum(r.lane is None for r in h.coordinator.routes.values()), 4)
         for agent, ids in prompts.items():
             self.assertEqual(h.coordinator.activate(agent).state, 'ready')
@@ -255,6 +309,40 @@ class QualificationLifecycleTests(unittest.TestCase):
         self.assertTrue(all(not w.engine.alive() for w in h.workers.values()))
         self.assertTrue(any(cmd == 'RELEASE_SLOT' for _, cmd in self.events))
         self.assertTrue(any(cmd == 'RESTORE_SLOT' for _, cmd in self.events))
+
+    def test_checkpoint_requires_exact_c_not_merely_any_prefix_of_p(self):
+        qc = self.client()
+        for wrong in ([1, 2], [1, 2, 3, 4], [1, 2, 99], [1, 2, 3, 4, 5],
+                      [1, 2, 3, 4, 5, 901]):
+            with self.subTest(wrong=wrong):
+                h = self.harness()
+                prompts = {'agent-0': [1, 2, 3, 4, 5], 'agent-1': [11, 12, 13, 14, 15]}
+                consumed = {agent: ids[:-2] for agent, ids in prompts.items()}
+                for agent, ids in prompts.items():
+                    qc.seed_owner_prefix_fixture(h, agent=agent, prompt_ids=ids, tail_tokens=2)
+                engine = h.workers['lane-0'].engine
+                engine.states[0] = list(wrong)
+                engine.slot_held[0] = list(wrong)
+                engine.epoch += 1
+                with self.assertRaisesRegex(RuntimeError, 'exact seeded C'):
+                    qc.checkpoint_prefixes(h, expected_prompts=prompts,
+                                           expected_consumed_prefixes=consumed)
+                self.assertTrue(h.services['lane-0'].native_lane_gated)
+                self.assertTrue(engine.alive())
+                self.assertFalse(any(cmd in ('RELEASE_SLOT', 'CLOSE') for _, cmd in self.events))
+
+    def test_invalid_expected_c_fails_before_gating_or_export(self):
+        qc = self.client()
+        h = self.harness()
+        prompts = {'agent-0': [1, 2, 3], 'agent-1': [4, 5, 6]}
+        for consumed in ({'agent-0': [1]}, {'agent-0': [], 'agent-1': [4]},
+                         {'agent-0': [1, 2, 3], 'agent-1': [4]},
+                         {'agent-0': [1, 99], 'agent-1': [4]}):
+            with self.assertRaises(ValueError):
+                qc.checkpoint_prefixes(h, expected_prompts=prompts,
+                                       expected_consumed_prefixes=consumed)
+        self.assertFalse(self.events)
+        self.assertFalse(getattr(h.services['lane-0'], 'native_lane_gated', False))
 
 
 if __name__ == '__main__':

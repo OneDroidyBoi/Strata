@@ -4,7 +4,48 @@ This directory holds the corrected runner client, tests, and source-only patches
 It does not deploy or launch an engine. Preserve failed windows and use a separate
 candidate for every qualification attempt.
 
-## Current correction: window29 inventory ownership
+## Current correction: window30 exact consumed-prefix checkpoint
+
+Window30 passed six GPU baselines, three-worker READY and the endpoint/native
+matrix, then failed in `checkpoint_prefixes`. Its legacy check compared P to
+held C and required P to prefix C. The P-first fixture deliberately saves
+C=P[:-k], so the correct checkpoint was rejected. This was reproduced with the
+real lifecycle and wire parser locally. The earlier integration test called
+coordinator consolidation directly and omitted this runner checkpoint helper.
+
+The client now supports an explicit `expected_consumed_prefixes` mapping. In
+this mode it requires exact agent coverage, nonempty C strictly prefixing P,
+and saved held IDs equal to that exact C. Count/payload integrity checks remain.
+Without the mapping the old full-prompt-priming contract remains unchanged;
+the two contracts are not combined into a permissive either-direction check.
+
+The corrected driver derives C from the isolated baseline fixtures and passes
+it to BOTH checkpoint calls, including the busy-request helper. Install the
+client and driver together in a new candidate. Apply `exact-c-client.patch`
+and `exact-c-driver.patch` against preserved window30 sources, or copy the two
+full Python files here. The client patch base is 8e9b95a6. Rebind source locks,
+plans and affected review receipts; preserve failed-window evidence. No backend,
+precision, native binary, or safety threshold changes are included.
+
+Current SHA256:
+
+- Client: `c12cff9c5d217f7c7aaee0cd9339e4f9f595d3c64c903d271430c3496f6cee18`
+- Driver: `a3202ac00b41a3b1c6a308af7f1e62da63f377eaefca5bf3a596b3ec0822e6e6`
+- Lifecycle integration test: `1ba986bc22ee9d9f75be360582888b3bfd91bb02708353a18bad667c316c8700`
+- Backend remains `d96e241fcc7b2245cfdc5f77f57dcf3671bc4320af79dba4cb06ffb0ccc96945`.
+
+153 local tests pass. The expanded integration executes the actual runner busy
+helper with real coordinator/admission/drain receipts: checkpoint twice, two
+concurrent disposable requests, busy response with unchanged ownership, drain,
+restore saved prefixes, consolidate, bind saved payloads and rotate all six
+agents twice with advanced histories. Only native execution and HTTP transport
+are simulated. Negative cases reject shorter C, longer C, changed same-length
+IDs, full P and advanced generated state. Invalid references fail before gating.
+The previous GPU failure is reproduced before the correction. These are CPU
+contract results; migrated GPU parity/reuse/rotation remains unqualified.
+
+## Prior correction: window29 inventory ownership (aab3182)
+
 
 The qualification client called `NativeLaneWorker._snapshot()` outside the
 worker's ownership transaction. Real lifecycle guards rejected the call before
@@ -27,10 +68,10 @@ without consuming its existing resume proof. Existing private guards remain.
 
 The client uses this operation before and after seeding. Native inventory
 versions may change during generation; the separate engine/Popen identity pin
-must remain stable. The bundled client is byte-identical to the runner's
+must remain stable. At aab3182, the bundled client was byte-identical to the runner's
 `window29-owner-inventory-api-candidate` finalized client.
 
-## Exact inputs
+## Inventory-correction inputs at aab3182 (historical hashes)
 
 SHA256:
 
