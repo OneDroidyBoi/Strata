@@ -449,8 +449,10 @@ stopped after successful consolidation; scaling back out is separate work.
 If an owned turn has not finished within the routing wait, `activate` or
 `consolidate` returns `waiting` without closing admission; it can be retried.
 The token iterator raises retryable `MigrationBusy` in that case. Failures after
-native state work begins remain gated. The operation timeout bounds each drain
-wait, not the total disk-transfer time.
+native state work begins remain gated. The routing timeout also bounds acquisition of the coordinator operation lock;
+lock contention returns retryable busy without changing native state. Time spent
+waiting for that lock is deducted from the subsequent active-turn wait. Native
+drain waits remain individually bounded; this is not a total disk-transfer deadline.
 Storage must accommodate all snapshots, including later rotations; automatic
 checkpoint garbage collection and disk quotas are not implemented. Calibrated host
 budgets must include retained state and checkpoint read scratch. This coordinator
@@ -578,3 +580,17 @@ Keep GPU validation with the runner and leave active benchmark lanes unchanged.
 fork. Keep changes opt-in and small so upstream fixes can be incorporated.
 Preserve upstream and dependency notices. Do not rewrite the running benchmark
 checkout or install this branch into active lanes.
+
+## Local review fixes (2026-10-20)
+
+- `17c8d96`: bound routing-lock acquisition and preserve the owner's lock on
+  timeout. The regression reproduced an expired request waiting indefinitely,
+  then verified retryable busy with no gating or native commands.
+- `cfc5269`: open checkpoint files nonblocking before validating their actual
+  inode type. A FIFO previously hung before the regular-file check; it now fails
+  immediately. Regular checkpoint read, checksum and fsync behavior is unchanged.
+
+These are Python-only changes, separately versioned from the runner's current
+qualification overlays. They do not establish GPU continuation correctness and
+should not be applied to an in-progress qualification run. Precision requirements
+remain Q4 minimum and Q8 or higher preferred.
