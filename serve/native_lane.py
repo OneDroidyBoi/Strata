@@ -552,8 +552,19 @@ class NativeLaneWorker:
         candidates = {f'{generation}:{sid}': sid for sid in ids}
         if session.session_id not in candidates:
             raise ValueError('session does not belong to the inventoried generation')
-        self.engine.session_export(generation, candidates[session.session_id], str(path))
+        sid = candidates[session.session_id]
+        expected_tokens = next(row[2] for row in self._inventory_detail[1] if row[0] == sid)
+        reply = self.engine.session_export(generation, sid, str(path))
         self._owned(drained=True)
+        # A valid checksum only proves the bytes we received. Cross-check the
+        # native completion against the frozen inventory before publishing or
+        # discarding the source's only in-memory state.
+        if (not isinstance(reply, dict) or type(reply.get('tokens')) is not int
+                or reply['tokens'] != expected_tokens or type(reply.get('bytes')) is not int
+                or reply['bytes'] != path.stat().st_size
+                or type(reply.get('ms')) not in (int, float)
+                or not math.isfinite(reply['ms']) or reply['ms'] < 0):
+            raise ValueError('native export acknowledgement does not match inventory or payload')
 
     def unload(self):
         self._owned(drained=True)

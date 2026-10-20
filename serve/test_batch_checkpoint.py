@@ -85,6 +85,8 @@ class BatchProtocolEngine:
             raise OSError('one slot export failed')
         Path(path).write_bytes(('native-state:' + session_id).encode())
         self.events.append(('export', session_id))
+        return {'tokens': next(e['tokens'] for e in self.entries if e['id'] == session_id),
+                'bytes': Path(path).stat().st_size, 'ms': 0.0}
 
     def session_file(self, action, path):
         raise AssertionError('shutdown must not restore')

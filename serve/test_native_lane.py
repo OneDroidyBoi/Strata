@@ -72,6 +72,8 @@ class Engine:
         Path(path).write_bytes(('state:' + sid).encode())
         if self.mutate_export:
             self.generation = 'process1-epoch3'
+        return {'tokens': next(e['tokens'] for e in self.entries if e['id'] == sid),
+                'bytes': Path(path).stat().st_size, 'ms': 0.0}
 
     def close(self):
         assert self.fifo.locked()
@@ -187,6 +189,25 @@ class NativeLaneTests(unittest.TestCase):
                 self.engine.precision_policy_report['artifact_audit'] = bad
                 with self.assertRaisesRegex(ValueError, 'architecture'):
                     NativeLaneWorker(self.service, self.model, enabled=True)
+
+    def test_export_acknowledgement_must_match_inventory_and_written_file(self):
+        for change in ({'tokens': 999}, {'bytes': 999}, {'tokens': True}, {'ms': float('nan')}):
+            with self.subTest(change=change):
+                # A fresh lane per scenario: failed checkpointing remains gated.
+                engine = Engine(self.model, self.service.fifo)
+                service = SimpleNamespace(engine=engine, fifo=self.service.fifo, request_admission=admission())
+                worker = NativeLaneWorker(service, self.model, enabled=True)
+                export = engine.session_export
+                def bad_export(*args):
+                    return {**export(*args), **change}
+                engine.session_export = bad_export
+                result = worker.persist_and_stop(self.store)
+                self.assertEqual(result.state, 'blocked')
+                self.assertIn('export acknowledgement', result.error)
+                self.assertEqual(engine.close_count, 0)
+                self.assertTrue(service.native_lane_gated)
+                self.assertEqual(service.request_admission.ledger.snapshot()['host_bytes'], 10)
+        self.assertFalse(any(p.name[0] != '.' for p in self.store.root.iterdir()))
 
     def test_full_inventory_published_before_confirmed_stop(self):
         original = deepcopy(self.engine.entries)
@@ -684,9 +705,10 @@ class NativeParkedLaneTests(unittest.TestCase):
         # Fake export must serialize the restored IDs just as native export would.
         original = service.engine.session_export
         def export(generation, sid, path):
-            original(generation, sid, path)
+            reply = original(generation, sid, path)
             if sid == 'slot-0':
                 Path(path).write_text('8,9,10')
+            return {**reply, 'bytes': Path(path).stat().st_size}
         service.engine.session_export = export
         parked = worker.quiesce_snapshot(self.store)
         self.assertEqual(parked.state, 'parked', parked.error)

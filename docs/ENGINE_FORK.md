@@ -600,3 +600,10 @@ and invalid timeouts with ValueError before entering a mutating operation. Such
 caller errors do not gate healthy lanes or mark the coordinator blocked. Native
 snapshot, restore, process-identity and integrity failures still fail closed.
 The HTTP gateway already validates these inputs; its response contract is unchanged.
+
+Native exports now require a completion acknowledgement whose token count matches
+that session's frozen inventory, byte count matches the written payload, and
+timing is finite and nonnegative. A mismatch blocks publication/source shutdown
+and retains fixed residency. Checksums still validate bytes independently; neither
+check establishes GPU continuation parity. Injected native-worker implementations
+must return the same `tokens`, `bytes`, `ms` dictionary as SessionProtocol.export.
