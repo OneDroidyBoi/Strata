@@ -166,3 +166,20 @@ together, rather than separately maintained idealized receipt dictionaries:
 
 These are follow-up test requirements, not implemented orchestration tests in
 this repository. They do not change or gate window30's already active soak.
+
+### Window31 bootstrap/template seam
+
+Runner-reported on October 20: the staged bootstrap failed before spawning its
+feed or observer because its STOP-hook string replacement expected an old
+direct-GET line. The updated observer template inserted a monotonic request
+start timestamp, so the exact replacement anchor no longer matched. This is a
+template composition failure, not an engine or GPU result. The runner owns the
+narrow anchor correction and independent review; no candidate is edited here.
+
+Before staging a future bundle, render every actual remote payload using the
+exact staged bootstrap and template bytes, including all sequential injections,
+then compile each complete generated Python payload without executing it. Test
+that every required insertion occurs exactly once, that the STOP hook remains
+in the final loop, and that a missing or ambiguous anchor prevents any remote
+spawn. Compiling templates or testing replacement snippets separately does not
+exercise this seam. Bind the rendered-payload test to the final source hashes.
