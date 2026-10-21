@@ -114,3 +114,21 @@ callability and no abort; then test a real second-sample failure is rejected.
 Do not repair the global namespace or replace the whole loop with extracted
 branch snippets in that test. No model/controller was started in the reported
 window33 failure; no GPU qualification follows from these source tests.
+
+## Follow-up: handoff persistence dispatch and interpreter identity
+
+The runner found window34's handoff validator was selected but its main receipt
+writer's window tuple still ended at 33. The corrected tuple includes 34. The
+new regression executes the actual bootstrap `main()` through the first feed
+launch boundary with remote I/O mocked, verifies the immediate-predecessor
+receipt is written exactly once to window34, and checks it precedes feed launch.
+It stubs the validator result, so the separate validator tests remain necessary.
+This thread independently passed 16 targeted tests across the handoff, bootstrap
+and rendered-observer execution modules. No candidate edits were made.
+
+Separately, launching with system Python failed because `regex` was absent;
+the runner reports the evaluated virtual environment completed that step.
+Future preflight should bind the actual interpreter executable/environment used
+by bootstrap, helpers and launch—not just source hashes—and run required import
+checks with that interpreter before side effects. This is follow-up guidance,
+not a request to delay the runner's corrected attempt or change its inputs.
