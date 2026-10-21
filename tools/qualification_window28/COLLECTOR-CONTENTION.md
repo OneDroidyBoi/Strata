@@ -132,3 +132,50 @@ Future preflight should bind the actual interpreter executable/environment used
 by bootstrap, helpers and launch—not just source hashes—and run required import
 checks with that interpreter before side effects. This is follow-up guidance,
 not a request to delay the runner's corrected attempt or change its inputs.
+
+## Follow-up: end-to-end freshness and service identity sampling
+
+Window34's cadence-only proposal shortened soak sleep from six to two seconds,
+keeping the 600-second duration and 15-second freshness limit. Source review
+shows this cannot cure every failure: attempt5's failure receipt has elapsed
+0.5 seconds and zero accepted samples, before the first end-of-loop sleep. This
+thread independently passed the eight soak validation tests; that is not live
+verification of the cadence hypothesis.
+
+The soak reads its heartbeat before VM GPU/service/process checks and then a
+serial PVE identity check. A future minimal ordering improvement is to perform
+the PVE identity check first and read the heartbeat as the final VM step, still
+aging every original measurement at the final decision. This removes avoidable
+post-read delay without fabricating freshness or adding BMC queries. Polling
+faster increases SSH/GPU query frequency; it does not itself cause the soak to
+issue BMC probes. The feed's own eight-second caches and sensor collection
+costs can still leave insufficient end-to-end freshness headroom.
+
+The later observer abort specifically reports stale fan service identity. In
+frozen feed 7ac134c3, active state/PID/restarts are sampled before CPU and optional
+fans; `service_state_age_s=finished-start` is then aged through caching and
+transport. The new hash-bound diagnostic executes that actual collector with
+simulated timings: service age 13.5s plus 2s transit exceeds 15s while CPU, fan
+and controller-log ages remain below 15s. This reproduces the mechanism, not
+the incident's measured latency. The original failure receipt omits rejected
+sample details, so it alone cannot establish the exact age contributions.
+
+Runner-owned repair guidance: genuinely re-read service active state, PID,
+start ticks and restart count after BMC collection. Capture both before/after
+identities and require equality; a restart, same-PID replacement or inactive
+state is not success. Prefer one bounded systemd status query for related
+fields, with process start-time validation. Start the new identity timestamp
+BEFORE the reads, so query latency is included. Preserve the independent CPU,
+fan and controller-log timestamps; refreshing identity does not refresh them.
+Retain all real faults and the original restoration deadline/incident binding.
+
+Replacement tests should cover stable resampling, PID/start/restart-count
+changes, inactive/missing identity, slow status queries, cache/transit aging,
+and stale CPU/fan/log evidence remaining rejected despite fresh identity. Store
+sanitized rejected sample ages and each acquisition/transport interval so a
+first-sample failure is diagnosable rather than recording only last_sample=null.
+
+`test_service_identity_age_reproducer.py` is a diagnostic of the frozen defect,
+not a fix regression. Together with the four earlier collector diagnostics,
+five tests passed. It executes selected function definitions only and performs
+no remote I/O. No candidate or running observer was changed here.

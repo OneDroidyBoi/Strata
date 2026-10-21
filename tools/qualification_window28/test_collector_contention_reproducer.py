@@ -32,7 +32,7 @@ def fixture(*, fan_fail=False, probe_seconds=0, service_seconds=0):
     def service(prop):
         clock.now += service_seconds
         return {'ActiveState': 'active', 'MainPID': '77', 'NRestarts': '0'}[prop]
-    def ipmi(*args):
+    def ipmi(*args, **kwargs):
         sensor = args[-1]
         calls.append(sensor)
         clock.now += probe_seconds
