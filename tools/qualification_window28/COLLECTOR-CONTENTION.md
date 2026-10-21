@@ -69,3 +69,29 @@ repeated busy fallback cannot extend that deadline. Add negative tests for
 real CPU faults, malformed data, changed identities and retained fresh fan
 faults, then execute actual producer→adapter→observer/controller composition
 with both normal and degraded branches. Preserve all safety thresholds.
+
+## Follow-up: snapshot identity alias
+
+The runner subsequently corrected these collector paths, then encountered a
+separate response-schema mismatch: the actual feed emitted `pid`, while the
+observer required `host_feed_pid`. A manually assembled test response supplied
+the missing field and hid the defect. The startup failed before model/controller
+execution. Frozen failure evidence remains runner-owned.
+
+The reviewed correction emits both names from the same captured `feed_pid`:
+feed SHA256 `7ac134c35f7273ebe2d2fb571c772d6c5cb7118bbd37866a765527f5dd3ace8d`.
+The new test evaluates the actual production snapshot dictionary expression and
+passes that result directly to `bound_fan_sample`; it checks the PID alias,
+start ticks, port and matching fan-source identity. This thread independently
+ran the four pipeline integration tests successfully without editing the
+candidate or executing remote actions. This verifies that scoped correction,
+not the entire live observer loop or GPU qualification.
+
+Future seam tests must carry producer-generated responses through consumers
+without `setdefault`, alias insertion or normalization that repairs the output.
+Keep the alias equality assertion because the observer consumes `host_feed_pid`
+but still writes its heartbeat identity from `pid`. Prefer also exercising the
+actual handler assembly and serialization with I/O mocked: the dictionary-only
+test does not itself execute the preceding `feed_pid = os.getpid()` assignment
+or surrounding HTTP control flow. This is follow-up coverage guidance, not a
+new blocker for the already corrected candidate.
