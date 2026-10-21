@@ -297,6 +297,74 @@ class LaneMigrationIntegrationTests(unittest.TestCase):
             self.assertEqual(service.engine.close_count, 0)
         self.assertFalse(any(command in ('RELEASE_SLOT', 'RESTORE_SLOT', 'CLOSE') for _, command in self.events))
 
+    def test_second_lane_directory_sync_failure_keeps_all_sources_loaded(self):
+        from serve.checkpoint_store import _sync_dir
+        before = {name: deepcopy(s.engine.states) for name, s in self.services.items()}
+        publications = 0
+
+        def sync(path):
+            nonlocal publications
+            if path == self.root:
+                publications += 1
+                if publications == 2:
+                    raise OSError('injected second bundle directory sync failure')
+            _sync_dir(path)
+
+        with patch('serve.checkpoint_store._sync_dir', side_effect=sync):
+            result = self.coordinator.consolidate(self.destination)
+        self.assertEqual(result.state, 'blocked')
+        self.assertIn('second bundle directory sync failure', result.error)
+        self.assertEqual(publications, 2)
+        for name, service in self.services.items():
+            self.assertEqual(service.engine.states, before[name])
+            self.assertTrue(service.engine.alive())
+            self.assertEqual(service.engine.close_count, 0)
+            self.assertTrue(service.native_lane_gated)
+            self.assertEqual(service.request_admission.ledger.snapshot()['host_bytes'], 10)
+        journal = json.loads(self.coordinator.journal_path.read_text())
+        self.assertEqual(set(journal['snapshots']), {'lane-0'})
+        # A renamed directory exists for lane-1, but failed fsync must not make
+        # it an accepted durable reference in either the journal or routes.
+        for agent, route in journal['agents'].items():
+            if route['lane'] != 'lane-0':
+                self.assertIsNone(route['checkpoint_id'])
+            else:
+                saved = []
+                self.store.restore(route['checkpoint_id'], route['session_id'], self.model,
+                                   lambda _, path: saved.append(json.loads(path.read_bytes())))
+                self.assertEqual(saved, [self.original[agent]])
+        self.assertFalse(any(cmd in ('RELEASE_SLOT', 'RESTORE_SLOT', 'CLOSE')
+                             for _, cmd in self.events))
+
+    def test_rotation_directory_sync_failure_preserves_advanced_resident_state(self):
+        from serve.checkpoint_store import _sync_dir
+        self.consolidate()
+        routes = self.coordinator.routes
+        incoming = next(a for a, r in routes.items() if r.lane is None)
+        engine = self.services[self.destination].engine
+        for slot in engine.states:
+            engine.states[slot] += [901, 902]
+            engine.slot_held[slot] = list(engine.states[slot])
+        engine.epoch += 1
+        before, start = deepcopy(engine.states), len(self.events)
+
+        def sync(path):
+            if path == self.root:
+                raise OSError('injected rotation directory sync failure')
+            _sync_dir(path)
+
+        with patch('serve.checkpoint_store._sync_dir', side_effect=sync):
+            result = self.coordinator.activate(incoming)
+        self.assertEqual(result.state, 'blocked')
+        self.assertIn('rotation directory sync failure', result.error)
+        self.assertEqual(engine.states, before)
+        self.assertEqual(self.coordinator.routes, routes)
+        self.assertTrue(engine.alive())
+        self.assertTrue(self.services[self.destination].native_lane_gated)
+        self.assertEqual(self.services[self.destination].request_admission.ledger.snapshot()['host_bytes'], 10)
+        self.assertFalse(any(cmd in ('RELEASE_SLOT', 'RESTORE_SLOT', 'CLOSE')
+                             for _, cmd in self.events[start:]))
+
     def test_restarted_destination_is_not_reused_under_old_agent_routes(self):
         self.consolidate()
         agent = next(a for a, r in self.coordinator.routes.items() if r.lane is not None)
