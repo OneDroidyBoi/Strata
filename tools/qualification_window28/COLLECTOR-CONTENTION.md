@@ -95,3 +95,22 @@ actual handler assembly and serialization with I/O mocked: the dictionary-only
 test does not itself execute the preceding `feed_pid = os.getpid()` assignment
 or surrounding HTTP control flow. This is follow-up coverage guidance, not a
 new blocker for the already corrected candidate.
+
+## Follow-up: sampler overwritten between observer iterations
+
+Window33 reached a second loop iteration and failed because the loop assigned
+`gpu_sample = gpu`, replacing the `gpu_sample()` function with its result dict.
+The isolated window34 fix removes that assignment and consistently uses `gpu`
+for data. Source review confirms the corrected loop retains the callable; this
+thread independently ran the five pipeline tests successfully. The new static
+test rejects assignments to the function name, but it is not two-iteration
+runtime evidence. Existing branch-test helpers still inject a dict named
+`gpu_sample` and therefore cannot exercise the real sampler call boundary.
+
+The runner owns the requested additional test: execute the exact fully rendered
+observer payload for at least two complete loop iterations with external I/O
+mocked. Assert two GPU query invocations, two heartbeat publications, unchanged
+callability and no abort; then test a real second-sample failure is rejected.
+Do not repair the global namespace or replace the whole loop with extracted
+branch snippets in that test. No model/controller was started in the reported
+window33 failure; no GPU qualification follows from these source tests.
